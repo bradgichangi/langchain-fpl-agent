@@ -1,3 +1,5 @@
 uagents
 openai
 python-dotenv
+langchain
+langchain-openai

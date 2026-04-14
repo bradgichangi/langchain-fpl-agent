@@ -11,6 +11,8 @@ from uagents_core.contrib.protocols.chat import (
     TextContent,
     chat_protocol_spec,
 )
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 
 load_dotenv(".env.local")
 
@@ -29,19 +31,25 @@ agent = Agent(
 
 chat_protocol = Protocol(spec=chat_protocol_spec)
 
+llm = ChatOpenAI(
+    model="asi1-mini",
+    api_key=os.getenv("ASI1_API_KEY"),
+    base_url="https://api.asi1.ai/v1",
+    temperature=0.2,
+)
 
-def ask_llm(prompt: str) -> str:
-    response = client.chat.completions.create(
-        model='asi1-mini',
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=300,
-    )
-    return response.choices[0].message.content or "No response generated."
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a helpful assistant."),
+        ("human", "{input}"),
+    ]
+)
 
+chain = prompt | llm
+
+def ask_llm(user_text: str) -> str:
+    result = chain.invoke({"input": user_text})
+    return result.content if result and result.content else "No response generated."
 
 @chat_protocol.on_message(model=ChatMessage)
 async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
