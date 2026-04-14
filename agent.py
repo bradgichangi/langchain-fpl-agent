@@ -9,6 +9,7 @@ from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     TextContent,
+    chat_protocol_spec,
 )
 
 load_dotenv(".env.local")
@@ -26,7 +27,7 @@ agent = Agent(
     readme_path = "README.md"
 )
 
-chat_protocol = Protocol(name="chat_bridge", version="1.0.0")
+chat_protocol = Protocol(spec=chat_protocol_spec)
 
 
 def ask_llm(prompt: str) -> str:
