@@ -93,6 +93,35 @@ def format_manager_reply(manager_data: dict) -> str:
         f"Raw data:\n{dumps(manager_data, indent=2)}"
     )
 
+
+def process_manager_data(user_text: str, manager_data: dict) -> str:
+    manager_snapshot = {
+        "manager_name": (
+            f"{manager_data.get('player_first_name', '')} "
+            f"{manager_data.get('player_last_name', '')}"
+        ).strip(),
+        "team_name": manager_data.get("name"),
+        "overall_rank": manager_data.get("summary_overall_rank"),
+        "overall_points": manager_data.get("summary_overall_points"),
+        "current_gw_points": manager_data.get("summary_event_points"),
+        "bank": manager_data.get("last_deadline_bank"),
+        "value": manager_data.get("last_deadline_value"),
+    }
+
+    reasoning_prompt = (
+        "You are an FPL reasoning assistant.\n"
+        "Use the provided manager data to answer the user.\n"
+        "Do not invent data that is not in the payload.\n"
+        "Provide concise reasoning and mention any limitations.\n\n"
+        f"User request: {user_text}\n\n"
+        "Manager snapshot:\n"
+        f"{dumps(manager_snapshot, indent=2)}\n\n"
+        "Full manager payload:\n"
+        f"{dumps(manager_data, indent=2)}"
+    )
+
+    return ask_llm(reasoning_prompt)
+
 @chat_protocol.on_message(model=ChatMessage)
 async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(
@@ -114,7 +143,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             manager_id = extract_manager_id(user_text)
             if manager_id is not None:
                 manager_data = fetch_fpl_manager_data(manager_id)
-                reply = format_manager_reply(manager_data)
+                reply = process_manager_data(user_text, manager_data)
             else:
                 reply = ask_llm(user_text)
         except URLError as exc:
