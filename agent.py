@@ -1,5 +1,9 @@
 import os
+import re
 from datetime import datetime, timezone
+from json import dumps, loads
+from urllib.error import URLError
+from urllib.request import urlopen
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -51,6 +55,44 @@ def ask_llm(user_text: str) -> str:
     result = chain.invoke({"input": user_text})
     return result.content if result and result.content else "No response generated."
 
+
+def extract_manager_id(user_text: str) -> int | None:
+    match = re.search(r"\bmanager\s*id\b\D*(\d+)", user_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    # If the user only sends a number, treat it as manager id.
+    user_text = user_text.strip()
+    if user_text.isdigit():
+        return int(user_text)
+
+    return None
+
+
+def fetch_fpl_manager_data(manager_id: int) -> dict:
+    url = f"https://fantasy.premierleague.com/api/entry/{manager_id}/"
+    with urlopen(url, timeout=10) as response:
+        payload = response.read().decode("utf-8")
+
+    return loads(payload)
+
+
+def format_manager_reply(manager_data: dict) -> str:
+    player_first_name = manager_data.get("player_first_name", "")
+    player_last_name = manager_data.get("player_last_name", "")
+    manager_name = f"{player_first_name} {player_last_name}".strip() or "Unknown"
+    team_name = manager_data.get("name", "Unknown")
+    overall_rank = manager_data.get("summary_overall_rank", "N/A")
+    total_points = manager_data.get("summary_overall_points", "N/A")
+
+    return (
+        f"Manager: {manager_name}\n"
+        f"Team: {team_name}\n"
+        f"Overall rank: {overall_rank}\n"
+        f"Total points: {total_points}\n\n"
+        f"Raw data:\n{dumps(manager_data, indent=2)}"
+    )
+
 @chat_protocol.on_message(model=ChatMessage)
 async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(
@@ -69,7 +111,14 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         reply = "Send me a text message and I will ask ASI1."
     else:
         try:
-            reply = ask_llm(user_text)
+            manager_id = extract_manager_id(user_text)
+            if manager_id is not None:
+                manager_data = fetch_fpl_manager_data(manager_id)
+                reply = format_manager_reply(manager_data)
+            else:
+                reply = ask_llm(user_text)
+        except URLError as exc:
+            reply = f"Could not reach FPL endpoint: {exc}"
         except Exception as exc:
             reply = f"LLM error: {exc}"
 
