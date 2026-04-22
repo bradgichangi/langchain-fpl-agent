@@ -1,0 +1,27 @@
+---
+description: Python standards for FPL tooling
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python Conventions
+
+- Keep functions small and focused: one network fetch or one transform per function.
+- Return JSON-serializable structures from helper functions; serialize (`dumps`) only at tool boundaries.
+- Add explicit fallback behavior for live-vs-static data mismatches.
+- Use typed signatures (`int | None`, `dict[str, Any]`) for new helpers.
+- Run quick smoke checks (`py_compile`) after edits and keep lint clean.
+
+## Example
+
+```python
+# Good: explicit fallback path
+player = local_map.get(player_id)
+if player is None:
+    player = live_map.get(player_id)
+```
+
+```python
+# Avoid: silent miss leading to vague user error
+player = local_map.get(player_id)
+```

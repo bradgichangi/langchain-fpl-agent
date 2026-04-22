@@ -1,0 +1,18 @@
+---
+description: FPL agent architecture guardrails
+alwaysApply: true
+---
+
+# FPL Agent Architecture
+
+- Keep `agent.py` as: `uAgents` transport + `create_deep_agent` orchestration + optional post-reasoning pass.
+- Prefer tools for factual data; do not answer manager/fixture/player facts from memory.
+- Avoid redundant tool calls. If `get_fpl_manager_current_team` was called, do not call `get_fpl_player` for the same picks unless extra fields are explicitly requested.
+- Keep static-first data access (`tools/fpl_static.py`) with explicit live fallback only when ID resolution misses.
+- Preserve structured logging for each stage: incoming message, deep-agent invoke, tool calls, reasoning pass, reply sent.
+- Never hardcode secrets; load from `.env.local`.
+
+## Example
+
+- **Good:** For "How are players in my team performing?" call `get_fpl_manager_current_team` once and summarize from returned pick metrics.
+- **Bad:** Call `get_fpl_manager_current_team`, then call `get_fpl_player` 15x for the same players.
