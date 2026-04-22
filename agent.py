@@ -23,6 +23,7 @@ from tools.agent_tools import (
     get_fpl_manager_current_team,
     get_fpl_manager_data,
     get_fpl_player,
+    get_fpl_scored_rankings,
     get_fpl_top_players,
     search_fpl_players,
 )
@@ -81,6 +82,7 @@ deep_agent = create_deep_agent(
         get_fpl_fixtures,
         get_fpl_player,
         get_fpl_top_players,
+        get_fpl_scored_rankings,
         search_fpl_players,
     ],
     system_prompt=(
@@ -94,7 +96,13 @@ deep_agent = create_deep_agent(
         "Only call get_fpl_player if the user explicitly requests additional fields not in that output. "
         "3) For fixture questions, call get_fpl_fixtures. "
         "4) For player lookup questions, call get_fpl_player or search_fpl_players. "
-        "5) For top/best player questions, call get_fpl_top_players with appropriate metric. "
+        "5) For top/best player questions by a single raw FPL metric (points, form, ownership), call get_fpl_top_players. "
+        "6) For RECOMMENDATION-style questions — who to captain, who to transfer in, best pick under £6m, "
+        "strongest GK/DEF/MID/FWD, differential picks — call get_fpl_scored_rankings. It returns "
+        "composite-scored players with tiers (MUST START > STRONG PICK > VIABLE OPTION > RISKY PICK > AVOID), "
+        "position, price, and factor breakdowns (fixture, form, value, xg_xa, availability, clean_sheet, etc.). "
+        "Use its filters (position, tier, min_price/max_price, min_minutes) rather than hand-filtering. "
+        "When answering recommendation questions, cite the tier and 1-2 dominant factors driving the score. "
         "Never invent FPL data; use tool output as source of truth and mention limits."
     ),
 )

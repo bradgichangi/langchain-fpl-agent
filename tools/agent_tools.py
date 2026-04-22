@@ -6,7 +6,7 @@ from urllib.request import urlopen
 from langchain_core.tools import tool
 
 from tools.fixtures import get_fixtures_by_gameweek
-from tools.fpl_static import load_bootstrap
+from tools.fpl_static import load_bootstrap, load_player_rankings
 
 logger = logging.getLogger("fpl-agent")
 
@@ -345,6 +345,120 @@ def get_fpl_top_players(
             "position_filter": pos_filter,
             "count": len(out),
             "players": out,
+        },
+        indent=2,
+    )
+
+
+_POSITION_ALIASES = {
+    "GK": "GOALKEEPER", "GKP": "GOALKEEPER", "GOALKEEPER": "GOALKEEPER",
+    "DEF": "DEFENDER", "DEFENDER": "DEFENDER",
+    "MID": "MIDFIELDER", "MIDFIELDER": "MIDFIELDER",
+    "FWD": "FORWARD", "FORWARD": "FORWARD",
+}
+
+
+@tool
+def get_fpl_scored_rankings(
+    position: str | None = None,
+    tier: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    min_minutes: int | None = None,
+    limit: int = 20,
+) -> str:
+    """Return players ranked by the composite `scoring_module` score.
+
+    This is the recommended tool for recommendation questions (transfers, captaincy,
+    best-in-position picks). Scores blend fixture difficulty, form, value, xG/xA,
+    availability, clean sheets, bonus rate and transfer momentum with
+    position-specific weights. Tiers are percentile-based within the full player pool.
+
+    Args:
+        position:    Optional filter — GK/DEF/MID/FWD or full name.
+        tier:        Optional filter — "MUST START", "STRONG PICK", "VIABLE OPTION",
+                     "RISKY PICK", "AVOID" (substring match, case-insensitive).
+        min_price:   Optional lower bound on price in £m (e.g. 4.5).
+        max_price:   Optional upper bound on price in £m (e.g. 6.0).
+        min_minutes: Optional minimum minutes played (filters rotation risks).
+        limit:       Max rows to return (1-100, default 20).
+    """
+    logger.info(
+        "Tool call start | get_fpl_scored_rankings | pos=%s | tier=%s | "
+        "price=%s-%s | min_minutes=%s | limit=%s",
+        position, tier, min_price, max_price, min_minutes, limit,
+    )
+
+    try:
+        data = load_player_rankings()
+    except FileNotFoundError as exc:
+        return dumps({"error": str(exc)})
+
+    pos_filter: str | None = None
+    if position:
+        key = position.strip().upper()
+        pos_filter = _POSITION_ALIASES.get(key)
+        if pos_filter is None:
+            return dumps({
+                "error": f"Unsupported position '{position}'.",
+                "allowed_positions": sorted(set(_POSITION_ALIASES)),
+            })
+
+    tier_filter = tier.strip().lower() if tier else None
+    limit = max(1, min(100, int(limit)))
+
+    players = data.get("players") or []
+    filtered: list[dict] = []
+    for p in players:
+        if pos_filter and p.get("position") != pos_filter:
+            continue
+        if tier_filter and tier_filter not in (p.get("tier") or "").lower():
+            continue
+        price = p.get("price")
+        if min_price is not None and (price is None or price < min_price):
+            continue
+        if max_price is not None and (price is None or price > max_price):
+            continue
+        if min_minutes is not None and (p.get("minutes") or 0) < min_minutes:
+            continue
+        filtered.append({
+            "rank": p.get("rank"),
+            "percentile": p.get("percentile"),
+            "id": p.get("id"),
+            "name": p.get("web_name"),
+            "full_name": p.get("full_name"),
+            "team": p.get("team"),
+            "position": p.get("position"),
+            "price": p.get("price"),
+            "total_points": p.get("total_points"),
+            "form": p.get("form"),
+            "minutes": p.get("minutes"),
+            "score": p.get("score"),
+            "tier": p.get("tier"),
+            "factors": p.get("factors"),
+        })
+        if len(filtered) >= limit:
+            break
+
+    logger.info(
+        "Tool call done | get_fpl_scored_rankings | returned=%s | total_pool=%s",
+        len(filtered), len(players),
+    )
+    return dumps(
+        {
+            "fetched_at": data.get("fetched_at"),
+            "n_fixtures_evaluated": data.get("n_fixtures_evaluated"),
+            "total_players_in_pool": data.get("total_players"),
+            "filters": {
+                "position": pos_filter,
+                "tier": tier_filter,
+                "min_price": min_price,
+                "max_price": max_price,
+                "min_minutes": min_minutes,
+                "limit": limit,
+            },
+            "count": len(filtered),
+            "players": filtered,
         },
         indent=2,
     )

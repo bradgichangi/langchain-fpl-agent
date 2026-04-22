@@ -8,6 +8,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_PATH = _REPO_ROOT / "data" / "fpl_static.json"
+_RANKINGS_PATH = _REPO_ROOT / "data" / "fpl_player_rankings.json"
 
 
 @lru_cache(maxsize=1)
@@ -57,3 +58,30 @@ def fixtures_for_event(event_id: int, path: str | None = None) -> list[dict]:
     if not isinstance(all_fixtures, list):
         return []
     return [fx for fx in all_fixtures if fx.get("event") == event_id]
+
+
+@lru_cache(maxsize=1)
+def _raw_rankings(path: str | None = None) -> dict:
+    p = Path(path) if path else _RANKINGS_PATH
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"Missing FPL rankings file: {p}. "
+            "Run: python scripts/rank_all_players.py"
+        )
+    with open(p, encoding="utf-8") as f:
+        return loads(f.read())
+
+
+def load_player_rankings(path: str | None = None) -> dict:
+    """Return the composite ranking snapshot produced by `scripts/rank_all_players.py`.
+
+    Structure:
+        {
+          "fetched_at": str, "n_fixtures_evaluated": int,
+          "total_players": int, "positions": {...},
+          "players": [ {rank, percentile, id, web_name, team, position,
+                        price, total_points, form, minutes, score, tier,
+                        factors: {...}}, ... ]
+        }
+    """
+    return _raw_rankings(path)
