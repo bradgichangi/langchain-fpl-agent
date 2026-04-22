@@ -6,7 +6,7 @@ from urllib.request import urlopen
 
 from langchain_core.tools import tool
 
-from chip_opportunity_module import ChipTimingEngine, serialize_chip_scores
+from modules.chip_opportunity_module import ChipTimingEngine, serialize_chip_scores
 from tools.fixtures import get_fixtures_by_gameweek
 from tools.fpl_static import load_bootstrap, load_player_rankings
 

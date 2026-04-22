@@ -11,7 +11,7 @@ It can answer manager-specific questions, rank players with a composite scoring 
 
 - Manager analysis (team, picks, bank, value, free transfers)
 - Upcoming gameweek awareness (fixtures, deadline, blanking players)
-- Composite player ranking engine (`scoring_module.py`) with:
+- Composite player ranking engine (`modules/scoring_module.py`) with:
   - fixture difficulty
   - form/value
   - xG/xA
@@ -19,7 +19,7 @@ It can answer manager-specific questions, rank players with a composite scoring 
   - transfer momentum
   - clean sheet / bonus rate
   - set-piece duties
-- Chip timing evaluator (`chip_opportunity_module.py`) for:
+- Chip timing evaluator (`modules/chip_opportunity_module.py`) for:
   - Wildcard
   - Free Hit
   - Bench Boost
@@ -32,8 +32,8 @@ It can answer manager-specific questions, rank players with a composite scoring 
 - `tools/agent_tools.py` - tool layer for manager, fixture, ranking, chip analysis
 - `tools/fixtures.py` - fixture fetch + team-name enrichment
 - `tools/fpl_static.py` - local data loaders
-- `scoring_module.py` - composite scoring engine + data mapper
-- `chip_opportunity_module.py` - chip timing engine
+- `modules/scoring_module.py` - composite scoring engine + data mapper
+- `modules/chip_opportunity_module.py` - chip timing engine
 - `scripts/fetch_fpl_static.py` - build local static snapshot
 - `scripts/rank_all_players.py` - generate ranked player JSON
 - `data/fpl_static.json` - local FPL static snapshot
@@ -107,7 +107,7 @@ The agent stores manager IDs per sender/session in `data/session_manager_ids.jso
 
 ## Scoring Model Notes
 
-`scoring_module.py` outputs a normalized composite score (`0.0` to `1.0`) and factor breakdown.  
+`modules/scoring_module.py` outputs a normalized composite score (`0.0` to `1.0`) and factor breakdown.  
 Tiers are applied by percentile over the full ranked population:
 
 - MUST START
@@ -123,7 +123,7 @@ Set-piece responsibility is included using FPL taker-order fields:
 
 ## Chip Opportunity Module
 
-`chip_opportunity_module.py` evaluates available chips for the target gameweek and returns:
+`modules/chip_opportunity_module.py` evaluates available chips for the target gameweek and returns:
 
 - score
 - confidence

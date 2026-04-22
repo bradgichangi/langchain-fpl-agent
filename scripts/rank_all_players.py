@@ -18,7 +18,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scoring_module import (  # noqa: E402
+from modules.scoring_module import (  # noqa: E402
     FPLDataMapper,
     FPLScorer,
     FixtureInfo,
