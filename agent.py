@@ -25,6 +25,7 @@ from tools.agent_tools import (
     get_fpl_player,
     get_fpl_scored_rankings,
     get_fpl_top_players,
+    get_fpl_upcoming_gameweek,
     search_fpl_players,
 )
 
@@ -79,6 +80,7 @@ deep_agent = create_deep_agent(
     tools=[
         get_fpl_manager_data,
         get_fpl_manager_current_team,
+        get_fpl_upcoming_gameweek,
         get_fpl_fixtures,
         get_fpl_player,
         get_fpl_top_players,
@@ -104,6 +106,16 @@ deep_agent = create_deep_agent(
         "Wildcard, Free Hit, Bench Boost, Triple Captain, Assistant Manager. "
         "Only one chip can be active per gameweek.\n"
         "Routing policy: "
+        "0) For ANY time-sensitive question (transfers, captain choice, 'this week', 'next match', "
+        "squad/starting XI changes, deadline, who plays this GW), call get_fpl_upcoming_gameweek "
+        "FIRST so your recommendation is anchored to the correct GW and you can quote the deadline. "
+        "Do not assume the gameweek; always confirm it via this tool when timing matters. "
+        "0a) Players must have a fixture in the upcoming GW to be a valid pick/captain/transfer-in. "
+        "get_fpl_scored_rankings already filters out blanks by default (must_play_upcoming=True) and "
+        "tags every row with `upcoming_plays`, `upcoming_opponents`. get_fpl_manager_current_team "
+        "returns an `upcoming_squad` block listing any blanking players in the current squad — "
+        "ALWAYS surface those to the user (warn against captaining/starting them; suggest bench / transfer). "
+        "Only set must_play_upcoming=False if the user explicitly asks about long-term value. "
         "1) If manager-specific analysis is requested and manager id is missing, ask for manager ID first. "
         "2) If manager id exists, call get_fpl_manager_data and/or get_fpl_manager_current_team as needed. "
         "2b) For questions like 'how are players in my team performing', use get_fpl_manager_current_team as the primary data source. "
@@ -125,15 +137,21 @@ deep_agent = create_deep_agent(
         "6) For RECOMMENDATION-style questions — who to captain, who to transfer in, best pick under £6m, "
         "strongest GK/DEF/MID/FWD, differential picks — call get_fpl_scored_rankings. It returns "
         "composite-scored players with tiers (MUST START > STRONG PICK > VIABLE OPTION > RISKY PICK > AVOID), "
-        "position, price, and factor breakdowns (fixture, form, value, xg_xa, availability, clean_sheet, etc.). "
+        "position, price, and factor breakdowns (fixture, form, value, xg_xa, availability, clean_sheet, "
+        "set_piece, etc.) plus a `set_pieces` block (penalty/FK/corner taker order + role label). "
         "Use its filters (position, tier, min_price/max_price, min_minutes) rather than hand-filtering. "
-        "When answering recommendation questions, cite the tier and 1-2 dominant factors driving the score.\n"
+        "When answering recommendation questions, cite the tier and 1-2 dominant factors driving the score, "
+        "and call out set-piece duties (especially primary penalty takers) since they materially raise ceiling.\n"
         "7) For full-squad-build requests ('build me a 15-man squad', 'pick my team'), "
-        "call get_fpl_scored_rankings once per position with the appropriate price ceilings, "
-        "then assemble exactly 2 GK / 5 DEF / 5 MID / 3 FWD that fits within the user's budget "
-        "(default £100.0m if unknown), respects the max-3-per-club rule, and where possible "
-        "leaves a usable bank. Always show the squad split by position with prices and a sum, "
-        "verify the sum is within budget, and confirm no club has more than 3 selections.\n\n"
+        "first call get_fpl_upcoming_gameweek so the build is anchored to the next GW "
+        "(quote the GW id and deadline in the answer). Then call get_fpl_scored_rankings "
+        "once per position with the appropriate price ceilings (keep must_play_upcoming=True so "
+        "no blanking players are picked), and assemble exactly 2 GK / 5 DEF / 5 MID / 3 FWD "
+        "that fits within the user's budget (default £100.0m if unknown), respects the "
+        "max-3-per-club rule, and where possible leaves a usable bank. Always show the squad "
+        "split by position with prices and a sum, verify the sum is within budget, "
+        "confirm no club has more than 3 selections, and confirm every selected player has "
+        "a fixture in the upcoming GW.\n\n"
         "Never invent FPL data; use tool output as source of truth and mention limits."
     ),
 )

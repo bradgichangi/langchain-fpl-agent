@@ -29,20 +29,85 @@ def fetch_fpl_bootstrap_live() -> dict:
     return loads(payload)
 
 
-def get_current_gameweek() -> int | None:
-    """Read current GW from local static bootstrap snapshot."""
-    bootstrap = load_bootstrap()
-    events = bootstrap.get("events") or []
+def _find_event(events: list[dict], flag: str) -> dict | None:
     for ev in events:
-        if ev.get("is_current") and isinstance(ev.get("id"), int):
-            return ev["id"]
-    # Fallback to live bootstrap when local snapshot is stale or offseason-marked.
-    live_bootstrap = fetch_fpl_bootstrap_live()
-    live_events = live_bootstrap.get("events") or []
-    for ev in live_events:
-        if ev.get("is_current") and isinstance(ev.get("id"), int):
-            return ev["id"]
+        if ev.get(flag) and isinstance(ev.get("id"), int):
+            return ev
     return None
+
+
+def get_current_gameweek() -> int | None:
+    """Read current GW (`is_current`) from local static bootstrap, live fallback."""
+    bootstrap = load_bootstrap()
+    ev = _find_event(bootstrap.get("events") or [], "is_current")
+    if ev is None:
+        ev = _find_event(fetch_fpl_bootstrap_live().get("events") or [], "is_current")
+    return ev["id"] if ev else None
+
+
+def get_next_gameweek_event() -> dict | None:
+    """Return the upcoming GW event dict (the one with `is_next: True`).
+
+    Prefers the live bootstrap-static so the deadline_time and flags reflect
+    the FPL state at query time rather than the snapshot's fetched_at.
+    """
+    live_events = fetch_fpl_bootstrap_live().get("events") or []
+    ev = _find_event(live_events, "is_next")
+    if ev is None:
+        ev = _find_event(load_bootstrap().get("events") or [], "is_next")
+    return ev
+
+
+def get_upcoming_fixture_map() -> tuple[int | None, dict[int, list[dict]]]:
+    """Return (upcoming_gw_id, {team_id: [fixture_dict, ...]}).
+
+    Each fixture_dict carries opponent metadata + home/away. Empty list = blank
+    GW for that team. Used to flag players who don't play in the upcoming GW.
+    """
+    next_ev = get_next_gameweek_event()
+    if not next_ev:
+        return None, {}
+    gw_id = next_ev["id"]
+    fixtures = get_fixtures_by_gameweek(gw_id)
+    bootstrap = fetch_fpl_bootstrap_live()
+    teams = bootstrap.get("teams") or []
+    short_by_id = {t.get("id"): t.get("short_name") for t in teams if t.get("id")}
+    name_by_id = {t.get("id"): t.get("name") for t in teams if t.get("id")}
+    by_team: dict[int, list[dict]] = {tid: [] for tid in short_by_id}
+    for fx in fixtures:
+        th, ta, kickoff = fx.get("team_h"), fx.get("team_a"), fx.get("kickoff_time")
+        if isinstance(th, int):
+            by_team.setdefault(th, []).append({
+                "opponent_id": ta,
+                "opponent_short": short_by_id.get(ta),
+                "opponent_name": name_by_id.get(ta),
+                "is_home": True,
+                "kickoff_time": kickoff,
+                "difficulty": fx.get("team_h_difficulty"),
+            })
+        if isinstance(ta, int):
+            by_team.setdefault(ta, []).append({
+                "opponent_id": th,
+                "opponent_short": short_by_id.get(th),
+                "opponent_name": name_by_id.get(th),
+                "is_home": False,
+                "kickoff_time": kickoff,
+                "difficulty": fx.get("team_a_difficulty"),
+            })
+    return gw_id, by_team
+
+
+def _summarize_upcoming(team_id: int | None, by_team: dict[int, list[dict]]) -> dict:
+    fxs = by_team.get(team_id, []) if isinstance(team_id, int) else []
+    return {
+        "plays_upcoming": bool(fxs),
+        "fixture_count": len(fxs),
+        "opponents": [
+            f"{fx.get('opponent_short') or '?'} ({'H' if fx.get('is_home') else 'A'})"
+            for fx in fxs
+        ],
+        "fixtures": fxs,
+    }
 
 
 def fetch_fpl_manager_team_data(manager_id: int, gameweek: int) -> dict:
@@ -274,14 +339,18 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
         if el.get("id") is not None
     }
 
+    upcoming_gw_id, upcoming_by_team = get_upcoming_fixture_map()
+
     picks = team_payload.get("picks") or []
     enriched_picks = []
+    blanks: list[dict] = []
     for pick in picks:
         element_id = pick.get("element")
         player = elements_by_id.get(element_id, {})
         team = teams_by_id.get(player.get("team"), {})
         element_type = element_types_by_id.get(player.get("element_type"), {})
         live_stats = live_stats_by_id.get(element_id, {})
+        upcoming = _summarize_upcoming(player.get("team"), upcoming_by_team)
         enriched_picks.append(
             {
                 **pick,
@@ -299,6 +368,10 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
                 "form": player.get("form"),
                 "points_per_game": player.get("points_per_game"),
                 "total_points": player.get("total_points"),
+                "upcoming_plays": upcoming["plays_upcoming"],
+                "upcoming_fixture_count": upcoming["fixture_count"],
+                "upcoming_opponents": upcoming["opponents"],
+                "upcoming_fixtures": upcoming["fixtures"],
                 "gw_points": live_stats.get("total_points"),
                 "gw_minutes": live_stats.get("minutes"),
                 "gw_goals": live_stats.get("goals_scored"),
@@ -310,6 +383,13 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
                 "gw_red_cards": live_stats.get("red_cards"),
             }
         )
+        if not upcoming["plays_upcoming"]:
+            blanks.append({
+                "element_id": element_id,
+                "player_name": player.get("web_name"),
+                "team_short_name": team.get("short_name"),
+                "position": element_type.get("singular_name_short"),
+            })
 
     free_transfers: dict | None
     try:
@@ -338,6 +418,16 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
         ),
     }
 
+    upcoming_squad_summary = {
+        "upcoming_gameweek": upcoming_gw_id,
+        "blank_count": len(blanks),
+        "blanking_players": blanks,
+        "_note": (
+            "Players in `blanking_players` have no fixture in the upcoming GW. "
+            "Flag them when discussing the squad and consider transfers/bench order."
+        ),
+    }
+
     output = {
         "manager_id": manager_id,
         "gameweek": gw,
@@ -345,6 +435,7 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
         "money": money_snapshot,
         "entry_history": entry_history,
         "free_transfers": free_transfers,
+        "upcoming_squad": upcoming_squad_summary,
         "picks": enriched_picks,
         "automatic_subs": team_payload.get("automatic_subs"),
     }
@@ -357,8 +448,50 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
 
 
 @tool
-def get_fpl_fixtures(gameweek: int) -> str:
-    """Get FPL fixtures for a gameweek, including team names."""
+def get_fpl_upcoming_gameweek() -> str:
+    """Return the upcoming gameweek context: id, name, deadline, fixtures.
+
+    Call this BEFORE answering any time-sensitive question (transfers, captain,
+    'this week', 'next match', squad changes) so your recommendation is
+    anchored to the correct GW and the user knows the deadline. Output also
+    includes the current GW and fixtures already enriched with team names.
+    """
+    logger.info("Tool call start | get_fpl_upcoming_gameweek")
+    next_ev = get_next_gameweek_event()
+    if not next_ev:
+        return dumps({"error": "Could not determine the upcoming gameweek."})
+    gw_id = next_ev["id"]
+    fixtures = get_fixtures_by_gameweek(gw_id)
+    current_gw = get_current_gameweek()
+    payload = {
+        "upcoming_gameweek": gw_id,
+        "name": next_ev.get("name"),
+        "deadline_time": next_ev.get("deadline_time"),
+        "is_current": bool(next_ev.get("is_current")),
+        "is_next": bool(next_ev.get("is_next")),
+        "current_gameweek": current_gw,
+        "fixture_count": len(fixtures),
+        "fixtures": fixtures,
+    }
+    logger.info(
+        "Tool call done | get_fpl_upcoming_gameweek | upcoming=%s | fixtures=%s",
+        gw_id, len(fixtures),
+    )
+    return dumps(payload, indent=2)
+
+
+@tool
+def get_fpl_fixtures(gameweek: int | None = None) -> str:
+    """Get FPL fixtures for a gameweek, including team names.
+
+    If `gameweek` is omitted, defaults to the upcoming GW (`is_next`), so the
+    agent can call this with no args for "this week's fixtures" questions.
+    """
+    if gameweek is None:
+        next_ev = get_next_gameweek_event()
+        if not next_ev:
+            return dumps({"error": "Could not determine the upcoming gameweek."})
+        gameweek = next_ev["id"]
     logger.info("Tool call start | get_fpl_fixtures | gameweek=%s", gameweek)
     fixtures = get_fixtures_by_gameweek(gameweek)
     logger.info("Tool call done | get_fpl_fixtures | fixtures=%s", len(fixtures))
@@ -529,6 +662,7 @@ def get_fpl_scored_rankings(
     min_price: float | None = None,
     max_price: float | None = None,
     min_minutes: int | None = None,
+    must_play_upcoming: bool = True,
     limit: int = 20,
 ) -> str:
     """Return players ranked by the composite `scoring_module` score.
@@ -538,19 +672,31 @@ def get_fpl_scored_rankings(
     availability, clean sheets, bonus rate and transfer momentum with
     position-specific weights. Tiers are percentile-based within the full player pool.
 
+    Each returned player is annotated with `upcoming_plays`, `upcoming_opponents`,
+    and `upcoming_fixtures` for the next GW so blanks are obvious. By default
+    blanking players are filtered out. A `set_pieces` block is also included
+    per row (penalties / direct FK / corners taker order, plus a human-readable
+    `role` like "primary pen, secondary corners"), and the composite score
+    factors a `set_piece` term in.
+
     Args:
-        position:    Optional filter — GK/DEF/MID/FWD or full name.
-        tier:        Optional filter — "MUST START", "STRONG PICK", "VIABLE OPTION",
-                     "RISKY PICK", "AVOID" (substring match, case-insensitive).
-        min_price:   Optional lower bound on price in £m (e.g. 4.5).
-        max_price:   Optional upper bound on price in £m (e.g. 6.0).
-        min_minutes: Optional minimum minutes played (filters rotation risks).
-        limit:       Max rows to return (1-100, default 20).
+        position:           Optional filter — GK/DEF/MID/FWD or full name.
+        tier:               Optional filter — "MUST START", "STRONG PICK",
+                            "VIABLE OPTION", "RISKY PICK", "AVOID"
+                            (substring match, case-insensitive).
+        min_price:          Optional lower bound on price in £m (e.g. 4.5).
+        max_price:          Optional upper bound on price in £m (e.g. 6.0).
+        min_minutes:        Optional minimum minutes played (filters rotation risks).
+        must_play_upcoming: If True (default), exclude players whose club has no
+                            fixture in the upcoming GW. Set False only when the
+                            user explicitly wants longer-horizon analysis.
+        limit:              Max rows to return (1-100, default 20).
     """
     logger.info(
         "Tool call start | get_fpl_scored_rankings | pos=%s | tier=%s | "
-        "price=%s-%s | min_minutes=%s | limit=%s",
-        position, tier, min_price, max_price, min_minutes, limit,
+        "price=%s-%s | min_minutes=%s | must_play_upcoming=%s | limit=%s",
+        position, tier, min_price, max_price, min_minutes,
+        must_play_upcoming, limit,
     )
 
     try:
@@ -571,8 +717,11 @@ def get_fpl_scored_rankings(
     tier_filter = tier.strip().lower() if tier else None
     limit = max(1, min(100, int(limit)))
 
+    upcoming_gw_id, upcoming_by_team = get_upcoming_fixture_map()
+
     players = data.get("players") or []
     filtered: list[dict] = []
+    excluded_blanks = 0
     for p in players:
         if pos_filter and p.get("position") != pos_filter:
             continue
@@ -585,6 +734,10 @@ def get_fpl_scored_rankings(
             continue
         if min_minutes is not None and (p.get("minutes") or 0) < min_minutes:
             continue
+        upcoming = _summarize_upcoming(p.get("team_id"), upcoming_by_team)
+        if must_play_upcoming and not upcoming["plays_upcoming"]:
+            excluded_blanks += 1
+            continue
         filtered.append({
             "rank": p.get("rank"),
             "percentile": p.get("percentile"),
@@ -592,6 +745,7 @@ def get_fpl_scored_rankings(
             "name": p.get("web_name"),
             "full_name": p.get("full_name"),
             "team": p.get("team"),
+            "team_id": p.get("team_id"),
             "position": p.get("position"),
             "price": p.get("price"),
             "total_points": p.get("total_points"),
@@ -600,27 +754,36 @@ def get_fpl_scored_rankings(
             "score": p.get("score"),
             "tier": p.get("tier"),
             "factors": p.get("factors"),
+            "set_pieces": p.get("set_pieces"),
+            "upcoming_plays": upcoming["plays_upcoming"],
+            "upcoming_fixture_count": upcoming["fixture_count"],
+            "upcoming_opponents": upcoming["opponents"],
+            "upcoming_fixtures": upcoming["fixtures"],
         })
         if len(filtered) >= limit:
             break
 
     logger.info(
-        "Tool call done | get_fpl_scored_rankings | returned=%s | total_pool=%s",
-        len(filtered), len(players),
+        "Tool call done | get_fpl_scored_rankings | returned=%s | total_pool=%s "
+        "| excluded_blanks=%s | upcoming_gw=%s",
+        len(filtered), len(players), excluded_blanks, upcoming_gw_id,
     )
     return dumps(
         {
             "fetched_at": data.get("fetched_at"),
             "n_fixtures_evaluated": data.get("n_fixtures_evaluated"),
             "total_players_in_pool": data.get("total_players"),
+            "upcoming_gameweek": upcoming_gw_id,
             "filters": {
                 "position": pos_filter,
                 "tier": tier_filter,
                 "min_price": min_price,
                 "max_price": max_price,
                 "min_minutes": min_minutes,
+                "must_play_upcoming": must_play_upcoming,
                 "limit": limit,
             },
+            "excluded_blanks": excluded_blanks,
             "count": len(filtered),
             "players": filtered,
         },

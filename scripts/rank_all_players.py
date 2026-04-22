@@ -24,6 +24,7 @@ from scoring_module import (  # noqa: E402
     FixtureInfo,
     Position,
     apply_percentile_tiers,
+    derive_set_piece_role,
 )
 
 OUT = ROOT / "data" / "fpl_player_rankings.json"
@@ -125,6 +126,17 @@ def main() -> None:
                     "momentum": breakdown.momentum,
                     "clean_sheet": breakdown.clean_sheet,
                     "bonus_rate": breakdown.bonus_rate,
+                    "set_piece": breakdown.set_piece,
+                },
+                "set_pieces": {
+                    "penalties_order": player.penalties_order,
+                    "direct_freekicks_order": player.direct_freekicks_order,
+                    "corners_order": player.corners_and_indirect_freekicks_order,
+                    "role": derive_set_piece_role(
+                        player.penalties_order,
+                        player.direct_freekicks_order,
+                        player.corners_and_indirect_freekicks_order,
+                    ),
                 },
             }
         )

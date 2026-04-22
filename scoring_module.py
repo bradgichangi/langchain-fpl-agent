@@ -35,11 +35,12 @@ BASE_WEIGHTS = {
     "form":          0.18,
     "value":         0.08,
     "home_away":     0.07,
-    "xg_xa":         0.15,
+    "xg_xa":         0.10,
     "availability":  0.12,
     "momentum":      0.08,
     "clean_sheet":   0.05,
     "bonus_rate":    0.05,
+    "set_piece":     0.05,
 }
 
 # Position-specific weight overrides
@@ -57,39 +58,43 @@ POSITION_WEIGHTS = {
         "momentum":      0.05,   # transfer noise rarely signals GK quality
         "clean_sheet":   0.23,   # primary point source after appearances
         "bonus_rate":    0.07,   # saves + CS drive BPS
+        "set_piece":     0.00,   # GKs effectively never take set pieces
     },
     Position.DEFENDER: {
-        "fixture":       0.20,   # CS factor already embeds fixture quality
+        "fixture":       0.18,   # CS factor already embeds fixture quality
         "form":          0.15,
         "value":         0.08,
-        "home_away":     0.07,
+        "home_away":     0.05,
         "xg_xa":         0.12,   # attacking fullbacks are the premium-defender meta
         "availability":  0.12,
         "momentum":      0.06,
         "clean_sheet":   0.15,   # 4 pts × CS rate materially shifts rankings
         "bonus_rate":    0.05,   # defender BPS overlaps with CS signal
+        "set_piece":     0.04,   # Trippier/TAA-types — modest but real assist signal
     },
     Position.MIDFIELDER: {
         "fixture":       0.15,   # attacking mids less fixture-correlated than defenders
-        "form":          0.22,   # form tracks attacking output well
+        "form":          0.18,   # form tracks attacking output well
         "value":         0.08,
         "home_away":     0.06,
-        "xg_xa":         0.22,   # primary predictor of goals/assists
+        "xg_xa":         0.18,   # primary predictor of goals/assists
         "availability":  0.10,
         "momentum":      0.08,
         "clean_sheet":   0.02,   # only 1 pt — near-negligible
         "bonus_rate":    0.07,   # BPS from attacking contributions
+        "set_piece":     0.08,   # primary pen/FK takers (Saka, Palmer) are massive
     },
     Position.FORWARD: {
         "fixture":       0.12,   # xG/xA already captures attacking fixture quality
-        "form":          0.22,
+        "form":          0.18,
         "value":         0.08,   # budget FWDs (Beto, Wissa) are a real edge
         "home_away":     0.06,
-        "xg_xa":         0.30,   # dominant predictor of forward returns
+        "xg_xa":         0.26,   # dominant predictor of forward returns
         "availability":  0.10,
         "momentum":      0.07,
         "clean_sheet":   0.00,   # forwards receive no CS points
         "bonus_rate":    0.05,
+        "set_piece":     0.08,   # primary pen takers (Haaland, Watkins) command premium
     },
 }
 
@@ -181,6 +186,31 @@ class PlayerData:
     clean_sheets: int = 0
     clean_sheet_opportunities: int = 0  # matches played (non-zero min)
 
+    # Set-piece duties — FPL exposes these as taker order
+    # (1 = primary, 2 = secondary, 3 = tertiary, None = not on duties)
+    penalties_order:                       Optional[int] = None
+    direct_freekicks_order:                Optional[int] = None
+    corners_and_indirect_freekicks_order:  Optional[int] = None
+
+
+_ORDER_LABEL = {1: "primary", 2: "secondary", 3: "tertiary"}
+
+
+def derive_set_piece_role(
+    pen_order: Optional[int],
+    fk_order: Optional[int],
+    corner_order: Optional[int],
+) -> str:
+    """Human-readable summary of a player's set-piece duties (e.g. for prompts)."""
+    parts: list[str] = []
+    if pen_order in _ORDER_LABEL:
+        parts.append(f"{_ORDER_LABEL[pen_order]} pen")
+    if fk_order in _ORDER_LABEL:
+        parts.append(f"{_ORDER_LABEL[fk_order]} FK")
+    if corner_order in _ORDER_LABEL:
+        parts.append(f"{_ORDER_LABEL[corner_order]} corners")
+    return ", ".join(parts) if parts else "none"
+
 
 @dataclass
 class ScoreBreakdown:
@@ -193,6 +223,7 @@ class ScoreBreakdown:
     momentum:     float = 0.0
     clean_sheet:  float = 0.0
     bonus_rate:   float = 0.0
+    set_piece:    float = 0.0
     sentiment:    float = 0.0   # external input, not weighted by default
     total:        float = 0.0
     tier:         str = ""
@@ -368,6 +399,45 @@ class FactorCalculators:
         per90 = bonus / (minutes / 90)
         return round(min(per90 / 1.0, 1.0), 4)
 
+    # Set-piece taker weights — penalties carry by far the biggest expected value
+    # (~75% conversion, certain shots), direct FKs next, corners last (assist-only).
+    _SET_PIECE_ROLE_WEIGHT = {
+        "penalties": 1.00,
+        "direct_freekicks": 0.60,
+        "corners": 0.40,
+    }
+    # Order discount: secondary takers get a chance only when primary is absent
+    # or yields the duty; tertiary is largely cosmetic.
+    _SET_PIECE_ORDER_DECAY = {1: 1.00, 2: 0.50, 3: 0.25}
+
+    @classmethod
+    def set_piece_score(
+        cls,
+        penalties_order: Optional[int],
+        direct_freekicks_order: Optional[int],
+        corners_order: Optional[int],
+    ) -> float:
+        """
+        Score the player's set-piece duties on a 0–1 scale.
+
+        Takes the *max* contribution across the three roles — a primary penalty
+        taker scores 1.0 regardless of corners, and we don't double-count someone
+        who happens to be on multiple set-piece duties.
+        """
+        contributions: list[float] = []
+        for order, role in (
+            (penalties_order,        "penalties"),
+            (direct_freekicks_order, "direct_freekicks"),
+            (corners_order,          "corners"),
+        ):
+            decay = cls._SET_PIECE_ORDER_DECAY.get(order)
+            if decay is None:
+                continue
+            contributions.append(cls._SET_PIECE_ROLE_WEIGHT[role] * decay)
+        if not contributions:
+            return 0.0
+        return round(min(max(contributions), 1.0), 4)
+
 
 # ---------------------------------------------------------------------------
 # Main Scorer
@@ -450,6 +520,11 @@ class FPLScorer:
                                 player.clean_sheet_opportunities,
                             ),
             "bonus_rate":   self.calc.bonus_rate_score(player.bonus, player.minutes),
+            "set_piece":    self.calc.set_piece_score(
+                                player.penalties_order,
+                                player.direct_freekicks_order,
+                                player.corners_and_indirect_freekicks_order,
+                            ),
         }
 
         # --- Weighted sum ---
@@ -469,6 +544,7 @@ class FPLScorer:
             momentum=     factors["momentum"],
             clean_sheet=  factors["clean_sheet"],
             bonus_rate=   factors["bonus_rate"],
+            set_piece=    factors["set_piece"],
             sentiment=    round(sentiment, 4),
             total=        total,
             tier=         self._get_tier(total),
@@ -562,6 +638,7 @@ class FPLScorer:
             f"  Momentum:       {breakdown.momentum:.2f}  (weight: {breakdown.weights_used.get('momentum', 0):.0%})",
             f"  Clean Sheets:   {breakdown.clean_sheet:.2f}  (weight: {breakdown.weights_used.get('clean_sheet', 0):.0%})",
             f"  Bonus Rate:     {breakdown.bonus_rate:.2f}  (weight: {breakdown.weights_used.get('bonus_rate', 0):.0%})",
+            f"  Set Pieces:     {breakdown.set_piece:.2f}  (weight: {breakdown.weights_used.get('set_piece', 0):.0%})",
             f"  Sentiment:      {breakdown.sentiment:.2f}  (community signal)",
         ]
         return "\n".join(lines)
@@ -604,6 +681,12 @@ class FPLDataMapper:
             clean_sheets=                   data.get("clean_sheets", 0),
             # clean_sheet_opportunities approximated by games started
             clean_sheet_opportunities=      data.get("starts", 0),
+            # Set-piece taker order (1=primary, 2=secondary, 3=tertiary, None=off duty)
+            penalties_order=                      data.get("penalties_order"),
+            direct_freekicks_order=               data.get("direct_freekicks_order"),
+            corners_and_indirect_freekicks_order= data.get(
+                "corners_and_indirect_freekicks_order"
+            ),
         )
 
     @staticmethod
@@ -661,6 +744,9 @@ if __name__ == "__main__":
         xa=8.1,
         clean_sheets=4,
         clean_sheet_opportunities=27,
+        penalties_order=1,
+        direct_freekicks_order=1,
+        corners_and_indirect_freekicks_order=2,
     )
 
     # Easy upcoming fixture run
