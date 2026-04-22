@@ -22,6 +22,7 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from tools.agent_tools import (
+    get_fpl_chip_opportunities,
     get_fpl_fixtures,
     get_fpl_manager_current_team,
     get_fpl_manager_data,
@@ -199,6 +200,7 @@ deep_agent = create_deep_agent(
     tools=[
         get_fpl_manager_data,
         get_fpl_manager_current_team,
+        get_fpl_chip_opportunities,
         get_fpl_upcoming_gameweek,
         get_fpl_fixtures,
         get_fpl_player,
@@ -249,6 +251,9 @@ deep_agent = create_deep_agent(
         "`bank_m` is the bank in £m, `squad_value_m` excludes bank, `team_value_m` includes bank. "
         "Do NOT read or interpret raw `bank` / `value` / `last_deadline_*` integers; those are in "
         "tenths of millions and the *_m fields are the correct display values. "
+        "2e) For chip timing / chip strategy questions (Wildcard, Free Hit, Bench Boost, Triple Captain), "
+        "call get_fpl_chip_opportunities. Use its scored recommendation, triggers, blockers, and wait_reason "
+        "instead of generic chip advice. "
         "3) For fixture questions, call get_fpl_fixtures. "
         "4) For player lookup questions, call get_fpl_player or search_fpl_players. "
         "5) For top/best player questions by a single raw FPL metric (points, form, ownership), call get_fpl_top_players. "

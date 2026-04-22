@@ -1,14 +1,45 @@
 import logging
 from functools import lru_cache
 from json import dumps, loads
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from langchain_core.tools import tool
 
+from chip_opportunity_module import ChipTimingEngine, serialize_chip_scores
 from tools.fixtures import get_fixtures_by_gameweek
 from tools.fpl_static import load_bootstrap, load_player_rankings
 
 logger = logging.getLogger("fpl-agent")
+
+
+def _normalize_chip_name(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    key = str(raw).strip().lower()
+    aliases = {
+        "wildcard": "wildcard",
+        "freehit": "free_hit",
+        "free_hit": "free_hit",
+        "bboost": "bench_boost",
+        "bench_boost": "bench_boost",
+        "bench boost": "bench_boost",
+        "3xc": "triple_captain",
+        "triple_captain": "triple_captain",
+        "triple captain": "triple_captain",
+    }
+    return aliases.get(key)
+
+
+def _available_chips_from_history(chips_used: list[dict]) -> list[str]:
+    # Current supported chips in this agent policy.
+    all_supported = ["wildcard", "free_hit", "bench_boost", "triple_captain"]
+    used = set()
+    for chip in chips_used:
+        norm = _normalize_chip_name(chip.get("name"))
+        if norm:
+            used.add(norm)
+    return [chip for chip in all_supported if chip not in used]
 
 
 def fetch_fpl_manager_data(manager_id: int) -> dict:
@@ -789,4 +820,164 @@ def get_fpl_scored_rankings(
         },
         indent=2,
     )
+
+
+@tool
+def get_fpl_chip_opportunities(
+    manager_id: int,
+    gameweek: int | None = None,
+    horizon_gws: int = 6,
+) -> str:
+    """Evaluate best chip timing for a manager (WC/FH/BB/TC).
+
+    Uses the `chip_opportunity_module` engine with:
+    - live manager picks for the target GW
+    - manager chip history (to infer available chips)
+    - composite player rankings + fixture context
+    - fixture map for current + near-term horizon
+    """
+    logger.info(
+        "Tool call start | get_fpl_chip_opportunities | manager_id=%s | gameweek=%s | horizon=%s",
+        manager_id,
+        gameweek,
+        horizon_gws,
+    )
+    manager_data = fetch_fpl_manager_data(manager_id)
+
+    gw = gameweek
+    if gw is None:
+        next_ev = get_next_gameweek_event()
+        gw = next_ev.get("id") if next_ev else None
+    if gw is None:
+        gw = get_current_gameweek()
+    if gw is None:
+        fallback_gw = manager_data.get("current_event")
+        if isinstance(fallback_gw, int):
+            gw = fallback_gw
+    if gw is None:
+        return dumps({"error": "Could not determine target gameweek."})
+
+    # Future GW picks may 404 before the deadline is locked; fallback to current.
+    team_candidates: list[int] = []
+    for candidate in (
+        gw,
+        manager_data.get("current_event"),
+        gw - 1 if isinstance(gw, int) else None,
+    ):
+        if isinstance(candidate, int) and candidate not in team_candidates and candidate >= 1:
+            team_candidates.append(candidate)
+
+    try:
+        team_payload = None
+        team_payload_gw = None
+        for candidate in team_candidates:
+            try:
+                team_payload = fetch_fpl_manager_team_data(manager_id, candidate)
+                team_payload_gw = candidate
+                break
+            except HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                raise
+        if team_payload is None:
+            return dumps(
+                {
+                    "error": (
+                        "Could not fetch manager picks for target or fallback gameweeks."
+                    ),
+                    "target_gameweek": gw,
+                    "attempted_gameweeks": team_candidates,
+                }
+            )
+        history_payload = fetch_fpl_manager_history(manager_id)
+        rankings = load_player_rankings().get("players") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Chip opportunity data fetch failed | manager_id=%s", manager_id)
+        return dumps({"error": f"Could not fetch required inputs: {exc}"})
+
+    # Build fixture map for current + near-term horizon.
+    horizon = max(1, min(int(horizon_gws), 12))
+    gw_fixture_map: dict[int, list[dict]] = {}
+    for event in range(gw, gw + horizon):
+        gw_fixture_map[event] = get_fixtures_by_gameweek(event)
+
+    fixture_count_by_team: dict[int, int] = {}
+    for fx in gw_fixture_map.get(gw, []):
+        th = fx.get("team_h")
+        ta = fx.get("team_a")
+        if isinstance(th, int):
+            fixture_count_by_team[th] = fixture_count_by_team.get(th, 0) + 1
+        if isinstance(ta, int):
+            fixture_count_by_team[ta] = fixture_count_by_team.get(ta, 0) + 1
+
+    chips_used = history_payload.get("chips") or []
+    available_chips = _available_chips_from_history(chips_used)
+
+    ranked_by_id = {p.get("id"): p for p in rankings if p.get("id") is not None}
+    ranked_players: list[dict] = []
+    for row in rankings:
+        team_id = row.get("team_id")
+        fixtures_this_gw = fixture_count_by_team.get(team_id, 0) if isinstance(team_id, int) else 0
+        ranked_players.append(
+            {
+                **row,
+                "web_name": row.get("web_name") or row.get("name"),
+                "breakdown": row.get("factors") or {},
+                "fixtures_this_gw": fixtures_this_gw,
+            }
+        )
+
+    picks = team_payload.get("picks") or []
+    squad_ids = [p.get("element") for p in picks if isinstance(p.get("element"), int)]
+    bench_picks = [p for p in picks if isinstance(p.get("position"), int) and p["position"] > 11]
+    bench_player_data: list[dict] = []
+    for p in bench_picks:
+        pid = p.get("element")
+        ranked = ranked_by_id.get(pid) or {}
+        fixture_count = 1
+        if isinstance(ranked.get("team_id"), int):
+            fixture_count = fixture_count_by_team.get(ranked["team_id"], 0)
+        bench_player_data.append(
+            {
+                "id": pid,
+                "score": ranked.get("score", 0.4),
+                "has_fixture": fixture_count >= 1,
+                "fixture_count": fixture_count,
+            }
+        )
+
+    remaining_gws = max(0, 38 - gw)
+    squad_context = {
+        "chips_available": available_chips,
+        "squad_ids": squad_ids,
+        "bench_ids": [p.get("element") for p in bench_picks if p.get("element") is not None],
+        "bench_player_data": bench_player_data,
+        "remaining_gws": remaining_gws,
+    }
+
+    engine = ChipTimingEngine()
+    scores = engine.evaluate_all_chips(
+        squad_context=squad_context,
+        current_gw=gw,
+        gw_fixture_map=gw_fixture_map,
+        ranked_players=ranked_players,
+        remaining_gws=remaining_gws,
+    )
+
+    payload = {
+        "manager_id": manager_id,
+        "target_gameweek": gw,
+        "manager_team_source_gameweek": team_payload_gw,
+        "remaining_gws": remaining_gws,
+        "chips_available": available_chips,
+        "chips_used": chips_used,
+        "best_chip_now": scores[0].chip if scores else None,
+        "chip_scores": serialize_chip_scores(scores),
+    }
+    logger.info(
+        "Tool call done | get_fpl_chip_opportunities | manager_id=%s | chips_evaluated=%s",
+        manager_id,
+        len(scores),
+    )
+    return dumps(payload, indent=2)
 

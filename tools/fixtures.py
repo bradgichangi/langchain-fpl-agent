@@ -31,7 +31,6 @@ def get_fixtures_by_gameweek(gameweek: int):
         ta = fixture.get("team_a")
         fixture["team_h_name"] = names.get(th, str(th))
         fixture["team_a_name"] = names.get(ta, str(ta))
-    print(fixtures)
     return fixtures
 
 
