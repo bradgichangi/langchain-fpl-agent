@@ -249,3 +249,103 @@ def search_fpl_players(name_query: str) -> str:
     logger.info("Tool call done | search_fpl_players | matches=%s", len(matches))
     return dumps(matches[:25], indent=2)
 
+
+@tool
+def get_fpl_top_players(
+    metric: str = "total_points", limit: int = 10, position: str | None = None
+) -> str:
+    """Get top FPL players by a metric.
+
+    Args:
+        metric: one of total_points, points_per_game, form, now_cost, selected_by_percent
+        limit: number of players to return (1-50)
+        position: optional filter GK, DEF, MID, FWD
+    """
+    allowed_metrics = {
+        "total_points",
+        "points_per_game",
+        "form",
+        "now_cost",
+        "selected_by_percent",
+    }
+    metric = metric.strip()
+    if metric not in allowed_metrics:
+        return dumps(
+            {
+                "error": f"Unsupported metric '{metric}'.",
+                "allowed_metrics": sorted(allowed_metrics),
+            }
+        )
+
+    limit = max(1, min(50, int(limit)))
+    bootstrap = fetch_fpl_bootstrap_live()
+    elements = bootstrap.get("elements") or []
+    teams = bootstrap.get("teams") or []
+    element_types = bootstrap.get("element_types") or []
+    teams_by_id = {t.get("id"): t for t in teams if t.get("id") is not None}
+    pos_by_id = {
+        et.get("id"): et.get("singular_name_short")
+        for et in element_types
+        if et.get("id") is not None
+    }
+
+    pos_filter = position.upper().strip() if position else None
+    if pos_filter and pos_filter not in {"GK", "DEF", "MID", "FWD"}:
+        return dumps({"error": "position must be one of GK, DEF, MID, FWD"})
+
+    def metric_value(player: dict) -> float:
+        value = player.get(metric)
+        if value is None:
+            return float("-inf")
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value))
+        except ValueError:
+            return float("-inf")
+
+    filtered = []
+    for p in elements:
+        pos = pos_by_id.get(p.get("element_type"))
+        if pos_filter and pos != pos_filter:
+            continue
+        filtered.append(p)
+
+    top_players = sorted(filtered, key=metric_value, reverse=True)[:limit]
+    out = []
+    for p in top_players:
+        team = teams_by_id.get(p.get("team"), {})
+        out.append(
+            {
+                "id": p.get("id"),
+                "name": p.get("web_name"),
+                "position": pos_by_id.get(p.get("element_type")),
+                "team_name": team.get("name"),
+                "team_short_name": team.get("short_name"),
+                "metric": metric,
+                "metric_value": p.get(metric),
+                "total_points": p.get("total_points"),
+                "points_per_game": p.get("points_per_game"),
+                "form": p.get("form"),
+                "now_cost": p.get("now_cost"),
+                "status": p.get("status"),
+                "injury_news": p.get("news"),
+            }
+        )
+
+    logger.info(
+        "Tool call done | get_fpl_top_players | metric=%s | position=%s | count=%s",
+        metric,
+        pos_filter,
+        len(out),
+    )
+    return dumps(
+        {
+            "metric": metric,
+            "position_filter": pos_filter,
+            "count": len(out),
+            "players": out,
+        },
+        indent=2,
+    )
+
