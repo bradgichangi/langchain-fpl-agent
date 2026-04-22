@@ -1,13 +1,15 @@
 import os
-import re
 from datetime import datetime, timezone
-from json import JSONDecodeError, dumps, loads
+from json import dumps, loads
 from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import uuid4
 
+from deepagents import create_deep_agent
 from dotenv import load_dotenv
-from openai import OpenAI
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
@@ -15,69 +17,18 @@ from uagents_core.contrib.protocols.chat import (
     TextContent,
     chat_protocol_spec,
 )
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+
+from tools.fixtures import get_fixtures_by_gameweek
+from tools.fpl_static import load_bootstrap
 
 load_dotenv(".env.local")
-
-# Step 1: router — FPL only: state the goal and what manager data to fetch (JSON only).
-ROUTER_INSTRUCTIONS = """You are a routing layer for a Fantasy Premier League (FPL) assistant.
-Every message is treated as an FPL question. Output a single JSON object (no markdown, no prose):
-{
-  "goal": "<short restatement of what the user wants>",
-  "required_data": ["<facts needed, e.g. manager_profile, overall_rank>"],
-  "tool_plan": [
-    {"tool": "get_fpl_manager_data", "manager_id": <integer or null>}
-  ],
-  "missing_inputs": ["<only if manager_id unknown: what to ask the user>"]
-}
-Rules:
-- If the message contains an FPL manager id (digits alone or e.g. "manager id 12345"), set tool_plan[0].manager_id to that integer.
-- If no manager id can be inferred, set manager_id to null and put clear asks in missing_inputs (e.g. "Send your FPL manager ID (the number in your team URL)").
-- required_data should list which parts of the manager API payload matter for answering the goal.
-"""
-
-
-def parse_router_json(raw: str) -> dict:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        return loads(text)
-    except JSONDecodeError:
-        return {
-            "goal": "",
-            "required_data": [],
-            "tool_plan": [],
-            "missing_inputs": ["Send your FPL manager ID so I can load your team."],
-        }
-
-
-def run_router(user_text: str) -> dict:
-    completion = client.chat.completions.create(
-        model="asi1-mini",
-        messages=[
-            {"role": "system", "content": ROUTER_INSTRUCTIONS},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=0,
-    )
-    content = completion.choices[0].message.content or "{}"
-    return parse_router_json(content)
-
-
-client = OpenAI(
-    api_key=os.getenv("ASI1_API_KEY"), 
-    base_url='https://api.asi1.ai/v1'
-)
 
 agent = Agent(
     name="FPL Bot",
     port=8000,
     mailbox=True,
     publish_agent_details=True,
-    readme_path = "README.md"
+    readme_path="README.md",
 )
 
 chat_protocol = Protocol(spec=chat_protocol_spec)
@@ -89,59 +40,18 @@ llm = ChatOpenAI(
     temperature=0.2,
 )
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", "You are an FPL (Fantasy Premier League) assistant."),
-        ("human", "{input}"),
-    ]
-)
-
-chain = prompt | llm
-
-def ask_llm(user_text: str) -> str:
-    result = chain.invoke({"input": user_text})
-    return result.content if result and result.content else "No response generated."
-
-
-def extract_manager_id(user_text: str) -> int | None:
-    match = re.search(r"\bmanager\s*id\b\D*(\d+)", user_text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-
-    # If the user only sends a number, treat it as manager id.
-    user_text = user_text.strip()
-    if user_text.isdigit():
-        return int(user_text)
-
-    return None
-
 
 def fetch_fpl_manager_data(manager_id: int) -> dict:
     url = f"https://fantasy.premierleague.com/api/entry/{manager_id}/"
     with urlopen(url, timeout=10) as response:
         payload = response.read().decode("utf-8")
-
     return loads(payload)
 
 
-def format_manager_reply(manager_data: dict) -> str:
-    player_first_name = manager_data.get("player_first_name", "")
-    player_last_name = manager_data.get("player_last_name", "")
-    manager_name = f"{player_first_name} {player_last_name}".strip() or "Unknown"
-    team_name = manager_data.get("name", "Unknown")
-    overall_rank = manager_data.get("summary_overall_rank", "N/A")
-    total_points = manager_data.get("summary_overall_points", "N/A")
-
-    return (
-        f"Manager: {manager_name}\n"
-        f"Team: {team_name}\n"
-        f"Overall rank: {overall_rank}\n"
-        f"Total points: {total_points}\n\n"
-        f"Raw data:\n{dumps(manager_data, indent=2)}"
-    )
-
-
-def process_manager_data(user_text: str, manager_data: dict) -> str:
+@tool
+def get_fpl_manager_data(manager_id: int) -> str:
+    """Get FPL manager profile data by manager ID."""
+    manager_data = fetch_fpl_manager_data(manager_id)
     manager_snapshot = {
         "manager_name": (
             f"{manager_data.get('player_first_name', '')} "
@@ -154,20 +64,79 @@ def process_manager_data(user_text: str, manager_data: dict) -> str:
         "bank": manager_data.get("last_deadline_bank"),
         "value": manager_data.get("last_deadline_value"),
     }
-
-    reasoning_prompt = (
-        "You are an FPL reasoning assistant.\n"
-        "Use the provided manager data to answer the user.\n"
-        "Do not invent data that is not in the payload.\n"
-        "Provide concise reasoning and mention any limitations.\n\n"
-        f"User request: {user_text}\n\n"
-        "Manager snapshot:\n"
-        f"{dumps(manager_snapshot, indent=2)}\n\n"
-        "Full manager payload:\n"
-        f"{dumps(manager_data, indent=2)}"
+    return dumps(
+        {"manager_snapshot": manager_snapshot, "manager_payload": manager_data}, indent=2
     )
 
-    return ask_llm(reasoning_prompt)
+
+@tool
+def get_fpl_fixtures(gameweek: int) -> str:
+    """Get FPL fixtures for a gameweek, including team names."""
+    fixtures = get_fixtures_by_gameweek(gameweek)
+    return dumps(fixtures, indent=2)
+
+
+@tool
+def get_fpl_player(player_id: int) -> str:
+    """Get FPL player data by player id from local static data."""
+    bootstrap = load_bootstrap()
+    elements = bootstrap.get("elements") or []
+    for p in elements:
+        if p.get("id") == player_id:
+            return dumps(p, indent=2)
+    return dumps({"error": f"Player id {player_id} not found."})
+
+
+@tool
+def search_fpl_players(name_query: str) -> str:
+    """Search local FPL players by name fragment."""
+    q = name_query.strip().lower()
+    if not q:
+        return dumps({"error": "name_query is required."})
+    bootstrap = load_bootstrap()
+    elements = bootstrap.get("elements") or []
+    matches = []
+    for p in elements:
+        haystack = " ".join(
+            [
+                str(p.get("web_name", "")),
+                str(p.get("first_name", "")),
+                str(p.get("second_name", "")),
+            ]
+        ).lower()
+        if q in haystack:
+            matches.append(p)
+    return dumps(matches[:25], indent=2)
+
+
+deep_agent = create_deep_agent(
+    model=llm,
+    tools=[get_fpl_manager_data, get_fpl_fixtures, get_fpl_player, search_fpl_players],
+    system_prompt=(
+        "You are an FPL assistant that must route requests and use tools when data is needed. "
+        "Routing policy: "
+        "1) If manager-specific analysis is requested and manager id is missing, ask for manager ID first. "
+        "2) If manager id exists, call get_fpl_manager_data. "
+        "3) For fixture questions, call get_fpl_fixtures. "
+        "4) For player lookup questions, call get_fpl_player or search_fpl_players. "
+        "Never invent FPL data; use tool output as source of truth and mention limits."
+    ),
+)
+
+
+def run_deep_agent(user_text: str, thread_id: str) -> str:
+    result = deep_agent.invoke(
+        {"messages": [{"role": "user", "content": user_text}]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+    messages = result.get("messages", [])
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            if isinstance(message.content, str):
+                return message.content
+            return str(message.content)
+    return "No response generated."
+
 
 @chat_protocol.on_message(model=ChatMessage)
 async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
@@ -184,37 +153,18 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     ).strip()
 
     if not user_text:
-        reply = "I'm here to help you with your FPL team. Please ask me a question about your team."
+        reply = (
+            "I can help with FPL manager, fixtures, and player questions. "
+            "Send a request and include manager ID for team-specific analysis."
+        )
     else:
         try:
-            plan = run_router(user_text)
-            manager_id = None
-            for step in plan.get("tool_plan") or []:
-                if step.get("tool") == "get_fpl_manager_data":
-                    mid = step.get("manager_id")
-                    if isinstance(mid, int):
-                        manager_id = mid
-                        break
-            if manager_id is None:
-                manager_id = extract_manager_id(user_text)
-
-            if manager_id is None:
-                missing = plan.get("missing_inputs") or []
-                reply = (
-                    "I need your FPL manager ID to look up your team (the number in your team URL on fantasy.premierleague.com). "
-                    + (" ".join(missing) if missing else "")
-                ).strip()
-            else:
-                manager_data = fetch_fpl_manager_data(manager_id)
-                router_context = dumps(plan, indent=2)
-                reply = process_manager_data(
-                    f"{user_text}\n\n[Router plan]\n{router_context}",
-                    manager_data,
-                )
+            reply = run_deep_agent(user_text, thread_id=sender)
         except URLError as exc:
             reply = f"Could not reach FPL endpoint: {exc}"
         except Exception as exc:
             reply = f"LLM error: {exc}"
+
     await ctx.send(
         sender,
         ChatMessage(

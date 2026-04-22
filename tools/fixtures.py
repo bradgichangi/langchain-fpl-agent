@@ -5,7 +5,7 @@ from __future__ import annotations
 from json import loads
 from urllib.request import urlopen
 
-from fpl_static import fixtures_for_event, team_id_to_name
+from tools.fpl_static import fixtures_for_event, team_id_to_name
 
 
 def _fetch_fixtures_remote(gameweek: int) -> list:
