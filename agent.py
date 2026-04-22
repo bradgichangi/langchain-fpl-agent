@@ -1,5 +1,8 @@
 import logging
 import os
+import re
+from json import JSONDecodeError, dump, load
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.error import URLError
 from uuid import uuid4
@@ -36,6 +39,122 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("fpl-agent")
+
+_SESSION_STATE_PATH = (
+    Path(__file__).resolve().parent / "data" / "session_manager_ids.json"
+)
+_MANAGER_ID_RE = re.compile(
+    r"(?:manager\s*id|my\s*id|entry\s*id)\D{0,12}(\d{4,12})",
+    flags=re.IGNORECASE,
+)
+_BARE_ID_RE = re.compile(r"\s*(\d{4,12})\s*")
+_CLEAR_ID_RE = re.compile(
+    r"\b(forget|clear|remove|reset)\b.{0,24}\b(manager\s*id|my\s*id|id)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _send_text_reply(sender: str, text: str) -> ChatMessage:
+    return ChatMessage(
+        timestamp=datetime.now(timezone.utc),
+        msg_id=uuid4(),
+        content=[TextContent(type="text", text=text)],
+    )
+
+
+def _load_manager_id_store() -> dict[str, int]:
+    if not _SESSION_STATE_PATH.is_file():
+        return {}
+    try:
+        with open(_SESSION_STATE_PATH, encoding="utf-8") as f:
+            raw = load(f)
+    except (OSError, JSONDecodeError):
+        logger.warning(
+            "Could not read session manager-id store | path=%s",
+            _SESSION_STATE_PATH,
+        )
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, int):
+            out[key] = value
+            continue
+        try:
+            out[key] = int(str(value))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _persist_manager_id_store(store: dict[str, int]) -> None:
+    try:
+        _SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SESSION_STATE_PATH, "w", encoding="utf-8") as f:
+            dump(store, f, indent=2)
+    except OSError as exc:
+        logger.warning(
+            "Could not persist session manager-id store | path=%s | err=%s",
+            _SESSION_STATE_PATH,
+            exc,
+        )
+
+
+MANAGER_ID_BY_SENDER: dict[str, int] = _load_manager_id_store()
+
+
+def _extract_manager_id_from_text(text: str) -> int | None:
+    # Prefer explicit mention to avoid confusing GW numbers or prices with IDs.
+    explicit = _MANAGER_ID_RE.search(text)
+    if explicit:
+        return int(explicit.group(1))
+    # Fallback: if user sends only a number, treat it as manager id.
+    bare = _BARE_ID_RE.fullmatch(text)
+    if bare:
+        return int(bare.group(1))
+    return None
+
+
+def _wants_to_clear_manager_id(text: str) -> bool:
+    return bool(_CLEAR_ID_RE.search(text))
+
+
+def _inject_manager_context(user_text: str, sender: str) -> str:
+    manager_id = MANAGER_ID_BY_SENDER.get(sender)
+    if manager_id is None:
+        return user_text
+    return (
+        f"{user_text}\n\n"
+        f"[Session context: default manager_id for this sender is {manager_id}. "
+        "Use it for manager-specific analysis unless the user provides a new manager id.]"
+    )
+
+
+def _handle_session_manager_id(sender: str, user_text: str) -> tuple[str | None, str]:
+    """Return (immediate_reply, augmented_user_text)."""
+    if _wants_to_clear_manager_id(user_text):
+        removed = MANAGER_ID_BY_SENDER.pop(sender, None)
+        _persist_manager_id_store(MANAGER_ID_BY_SENDER)
+        if removed is None:
+            return "No saved manager ID found for this session.", user_text
+        return "Saved manager ID cleared for this session.", user_text
+
+    extracted_manager_id = _extract_manager_id_from_text(user_text)
+    if extracted_manager_id is not None:
+        previous = MANAGER_ID_BY_SENDER.get(sender)
+        MANAGER_ID_BY_SENDER[sender] = extracted_manager_id
+        _persist_manager_id_store(MANAGER_ID_BY_SENDER)
+        logger.info(
+            "Stored manager id for sender | sender=%s | manager_id=%s | previous=%s",
+            sender,
+            extracted_manager_id,
+            previous,
+        )
+
+    return None, _inject_manager_context(user_text, sender)
 
 agent = Agent(
     name="FPL Bot",
@@ -102,8 +221,7 @@ deep_agent = create_deep_agent(
         "Transfers: 1 free transfer earned per gameweek, max 5 banked. "
         "Each extra transfer costs -4 points. Wildcard and Free Hit chips make all "
         "transfers in that GW free; both freeze the FT bank (no consume, no +1 earned).\n"
-        "Chips (one activation per chip per half-season window in 2025/26+): "
-        "Wildcard, Free Hit, Bench Boost, Triple Captain, Assistant Manager. "
+        "Chips: Wildcard, Free Hit, Bench Boost, Triple Captain. "
         "Only one chip can be active per gameweek.\n"
         "Routing policy: "
         "0) For ANY time-sensitive question (transfers, captain choice, 'this week', 'next match', "
@@ -215,23 +333,20 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             "Send a request and include manager ID for team-specific analysis."
         )
     else:
-        try:
-            reply = run_deep_agent(user_text, thread_id=sender)
-        except URLError as exc:
-            logger.exception("FPL API network error | sender=%s", sender)
-            reply = f"Could not reach FPL endpoint: {exc}"
-        except Exception as exc:
-            logger.exception("Unhandled agent error | sender=%s", sender)
-            reply = f"LLM error: {exc}"
+        immediate_reply, augmented_user_text = _handle_session_manager_id(sender, user_text)
+        if immediate_reply is not None:
+            reply = immediate_reply
+        else:
+            try:
+                reply = run_deep_agent(augmented_user_text, thread_id=sender)
+            except URLError as exc:
+                logger.exception("FPL API network error | sender=%s", sender)
+                reply = f"Could not reach FPL endpoint: {exc}"
+            except Exception as exc:
+                logger.exception("Unhandled agent error | sender=%s", sender)
+                reply = f"LLM error: {exc}"
 
-    await ctx.send(
-        sender,
-        ChatMessage(
-            timestamp=datetime.now(timezone.utc),
-            msg_id=uuid4(),
-            content=[TextContent(type="text", text=reply)],
-        ),
-    )
+    await ctx.send(sender, _send_text_reply(sender, reply))
     logger.info("Reply sent | sender=%s | reply_chars=%s", sender, len(reply))
 
 
