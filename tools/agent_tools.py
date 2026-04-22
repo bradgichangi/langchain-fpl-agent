@@ -65,11 +65,137 @@ def fetch_fpl_event_live_data(gameweek: int) -> dict:
     return loads(payload)
 
 
+def fetch_fpl_manager_history(manager_id: int) -> dict:
+    logger.info("Fetching manager history | manager_id=%s", manager_id)
+    url = f"https://fantasy.premierleague.com/api/entry/{manager_id}/history/"
+    with urlopen(url, timeout=15) as response:
+        payload = response.read().decode("utf-8")
+    return loads(payload)
+
+
+# FPL rule (2024/25+): managers can bank up to 5 free transfers. Earlier
+# seasons capped at 2; this constant affects the max banked state only.
+MAX_FREE_TRANSFERS = 5
+
+
+def compute_free_transfers(history: dict) -> dict:
+    """Derive banked free transfers from a manager's /history/ payload.
+
+    FPL does not expose free-transfer count on public endpoints, so we replay
+    GW-by-GW transfer activity with the banking rules:
+      * +1 FT earned each completed GW (cap at `MAX_FREE_TRANSFERS`).
+      * `event_transfers` consume banked FTs first; remainder becomes hits.
+      * Wildcard and Free Hit: transfers are free; the FT bank is preserved
+        and the GW's +1 is NOT earned (the chip replaces the FT economy for
+        that GW). Pre-2024/25 Wildcard used to reset bank to 1; that rule
+        changed and the new behaviour is verified against live /history/ data.
+      * Bench Boost / Triple Captain / Assistant Manager: no effect.
+    Returns the state *after* the last completed GW, i.e. the FTs the manager
+    carries into the upcoming GW.
+    """
+    current = history.get("current") or []
+    chips = history.get("chips") or []
+    chip_by_event: dict[int, str] = {
+        c["event"]: (c.get("name") or "").lower()
+        for c in chips
+        if isinstance(c.get("event"), int)
+    }
+
+    bank = 1  # every manager starts the season with 1 FT pre-GW1
+    transfers_total = 0
+    hits_total = 0
+    last_gw: int | None = None
+    trajectory: list[dict] = []
+
+    for row in current:
+        event = row.get("event")
+        if not isinstance(event, int):
+            continue
+        last_gw = event
+        event_transfers = int(row.get("event_transfers") or 0)
+        event_hit_cost = int(row.get("event_transfers_cost") or 0)
+        transfers_total += event_transfers
+        hits_total += event_hit_cost
+
+        bank_before = bank
+        chip = chip_by_event.get(event)
+        if chip in ("wildcard", "freehit"):
+            # Both chips freeze the FT economy under 2024/25+ rules:
+            # chip-GW transfers are free, bank is preserved, no +1 earned.
+            # (Pre-2024/25 Wildcard reset bank to 1; that no longer applies —
+            # verified against real /history/ data.)
+            pass
+        else:
+            used_free = min(event_transfers, bank)
+            bank = min(bank - used_free + 1, MAX_FREE_TRANSFERS)
+
+        trajectory.append({
+            "event": event,
+            "transfers_made": event_transfers,
+            "hit_cost": event_hit_cost,
+            "chip": chip,
+            "bank_before": bank_before,
+            "bank_after": bank,
+        })
+
+    last_row = current[-1] if current else {}
+    return {
+        "free_transfers_available": bank,
+        "max_banked": MAX_FREE_TRANSFERS,
+        "last_completed_gw": last_gw,
+        "last_gw_transfers": int(last_row.get("event_transfers") or 0) if last_row else 0,
+        "last_gw_hit_cost": int(last_row.get("event_transfers_cost") or 0) if last_row else 0,
+        "season_totals": {
+            "transfers": transfers_total,
+            "hit_cost": hits_total,
+            "gameweeks_played": len(current),
+        },
+        "chips_used": [
+            {"name": c.get("name"), "event": c.get("event"), "time": c.get("time")}
+            for c in chips
+        ],
+        # Full per-GW FT trajectory — useful for diagnosing off-by-one disputes
+        # against the FPL UI. `bank_after` = FTs heading into the next GW.
+        "ft_trajectory": trajectory,
+        "notes": [
+            "Derived from /history/ using FPL 2024/25+ banking rules (cap = 5).",
+            "Wildcard and Free Hit GWs freeze the FT bank — no transfers "
+            "consumed, no +1 earned.",
+            "`free_transfers_available` = FTs heading into the GW AFTER "
+            "`last_completed_gw`. Does not reflect transfers made between that "
+            "deadline and the next /history/ refresh.",
+        ],
+    }
+
+
+def _tenths_to_millions(raw: int | None) -> float | None:
+    """FPL stores prices / bank / team value in tenths of £m (e.g. 1053 → £105.3m)."""
+    if raw is None:
+        return None
+    try:
+        return round(int(raw) / 10, 1)
+    except (TypeError, ValueError):
+        return None
+
+
 @tool
 def get_fpl_manager_data(manager_id: int) -> str:
-    """Get FPL manager profile data by manager ID."""
+    """Get FPL manager profile data by manager ID.
+
+    Money fields are converted from FPL's raw tenths-of-millions ints to £m
+    floats, and the team's total value is split into `squad_value_m` (excluding
+    bank) vs `team_value_m` (including bank, matches FPL's "Team Value" UI).
+    """
     logger.info("Tool call start | get_fpl_manager_data | manager_id=%s", manager_id)
     manager_data = fetch_fpl_manager_data(manager_id)
+    bank_raw = manager_data.get("last_deadline_bank")
+    value_raw = manager_data.get("last_deadline_value")
+    bank_m = _tenths_to_millions(bank_raw)
+    team_value_m = _tenths_to_millions(value_raw)
+    squad_value_m = None
+    if isinstance(bank_raw, int) and isinstance(value_raw, int):
+        squad_value_m = round((value_raw - bank_raw) / 10, 1)
+
     manager_snapshot = {
         "manager_name": (
             f"{manager_data.get('player_first_name', '')} "
@@ -79,8 +205,14 @@ def get_fpl_manager_data(manager_id: int) -> str:
         "overall_rank": manager_data.get("summary_overall_rank"),
         "overall_points": manager_data.get("summary_overall_points"),
         "current_gw_points": manager_data.get("summary_event_points"),
-        "bank": manager_data.get("last_deadline_bank"),
-        "value": manager_data.get("last_deadline_value"),
+        "bank_m": bank_m,
+        "squad_value_m": squad_value_m,
+        "team_value_m": team_value_m,
+        "total_transfers_season": manager_data.get("last_deadline_total_transfers"),
+        "_units": (
+            "All money values are in £m (e.g. 4.9 = £4.9m). "
+            "squad_value_m excludes bank; team_value_m includes bank."
+        ),
     }
     return dumps(
         {"manager_snapshot": manager_snapshot, "manager_payload": manager_data}, indent=2
@@ -93,6 +225,9 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
 
     This already includes player identity + core metadata per pick, so prefer this
     over per-player follow-up calls unless the user explicitly asks for extra fields.
+    The output also includes a derived `free_transfers` block (banked FTs for the
+    upcoming GW plus season transfer/hit totals), so use this tool for questions
+    about free transfers, hits, or how many transfers a manager has made.
     """
     gw = gameweek or get_current_gameweek()
     if gw is None:
@@ -176,11 +311,40 @@ def get_fpl_manager_current_team(manager_id: int, gameweek: int | None = None) -
             }
         )
 
+    free_transfers: dict | None
+    try:
+        history_payload = fetch_fpl_manager_history(manager_id)
+        free_transfers = compute_free_transfers(history_payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not compute free transfers | manager_id=%s | err=%s",
+            manager_id, exc,
+        )
+        free_transfers = {"error": f"Could not derive free transfers: {exc}"}
+
+    entry_history = team_payload.get("entry_history") or {}
+    eh_bank = entry_history.get("bank")
+    eh_value = entry_history.get("value")
+    squad_value_m = None
+    if isinstance(eh_bank, int) and isinstance(eh_value, int):
+        squad_value_m = round((eh_value - eh_bank) / 10, 1)
+    money_snapshot = {
+        "bank_m": _tenths_to_millions(eh_bank),
+        "squad_value_m": squad_value_m,
+        "team_value_m": _tenths_to_millions(eh_value),
+        "_units": (
+            "All money values are in £m (e.g. 4.9 = £4.9m). "
+            "squad_value_m excludes bank; team_value_m includes bank."
+        ),
+    }
+
     output = {
         "manager_id": manager_id,
         "gameweek": gw,
         "active_chip": team_payload.get("active_chip"),
-        "entry_history": team_payload.get("entry_history"),
+        "money": money_snapshot,
+        "entry_history": entry_history,
+        "free_transfers": free_transfers,
         "picks": enriched_picks,
         "automatic_subs": team_payload.get("automatic_subs"),
     }
