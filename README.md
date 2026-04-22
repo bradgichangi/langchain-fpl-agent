@@ -102,7 +102,7 @@ You should see your agent address in stdout.
 
 The agent stores manager IDs per sender/session in `data/session_manager_ids.json`.
 
-- If a user says `my id is 9793856`, future manager-specific requests reuse it.
+- If a user says `my id is 1234567`, future manager-specific requests reuse it.
 - Users can clear it with phrases like `forget manager id` or `clear my id`.
 
 ## Scoring Model Notes
