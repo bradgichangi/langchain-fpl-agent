@@ -3,3 +3,4 @@
 .env.local
 __pycache__/
 private_keys.json
+data/fpl_static.json
