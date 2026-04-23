@@ -1,5 +1,4 @@
 from dataclasses import asdict, dataclass
-from typing import Any
 
 
 @dataclass
@@ -15,9 +14,6 @@ class ChipOpportunityScore:
 
 class ChipTimingEngine:
     """Evaluate chip timing from squad + fixture + ranking context."""
-
-    def __init__(self, scorer: Any | None = None):
-        self.scorer = scorer
 
     def evaluate_all_chips(
         self,
