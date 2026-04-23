@@ -31,6 +31,7 @@ from tools.agent_tools import (
     get_fpl_top_players,
     get_fpl_upcoming_gameweek,
     search_fpl_players,
+    search_web,
 )
 
 load_dotenv(".env.local")
@@ -174,15 +175,22 @@ llm = ChatOpenAI(
     temperature=0.2,
 )
 
+_REASONING_TODAY_ISO = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+_REASONING_TODAY_HUMAN = datetime.now(timezone.utc).strftime("%A %B %d, %Y")
+
 reasoning_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
+            f"CURRENT DATE: {_REASONING_TODAY_HUMAN} (ISO {_REASONING_TODAY_ISO}). "
+            "Trust this over any internal training-cutoff assumption. "
             "You are an FPL reasoning assistant. Improve clarity and reasoning while "
             "staying faithful to tool-derived facts. Do not invent missing data. "
             "Tool evidence provided below is already fetched and available to you. "
             "Do NOT say you lack access to data, cannot verify, or cannot access tools. "
-            "If evidence is missing a requested field, state that specific limitation.",
+            "If evidence is missing a requested field, state that specific limitation. "
+            "If tool evidence contains web search results with URLs, preserve those URLs "
+            "as inline citations (e.g. `(source: <url>)`) in the final answer.",
         ),
         (
             "human",
@@ -194,6 +202,11 @@ reasoning_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 reasoning_chain = reasoning_prompt | llm | StrOutputParser()
+
+_TODAY = datetime.now(timezone.utc)
+_TODAY_ISO = _TODAY.strftime("%Y-%m-%d")
+_TODAY_HUMAN = _TODAY.strftime("%A %B %d, %Y")
+_CURRENT_YEAR = _TODAY.year
 
 deep_agent = create_deep_agent(
     model=llm,
@@ -207,8 +220,14 @@ deep_agent = create_deep_agent(
         get_fpl_top_players,
         get_fpl_scored_rankings,
         search_fpl_players,
+        search_web,
     ],
     system_prompt=(
+        f"CURRENT DATE: {_TODAY_HUMAN} (ISO {_TODAY_ISO}). The current year is "
+        f"{_CURRENT_YEAR}. Trust this date over any internal training-cutoff assumption. "
+        f"When calling search_web for recency-sensitive questions, include "
+        f"'{_CURRENT_YEAR}' (or the current month/year) in the query string and set "
+        f"time_range='d' or 'w' so results are actually current.\n\n"
         "You are an FPL (Fantasy Premier League) assistant. You already know the FPL "
         "rules below; never ask the user to remind you of them, and always honor them "
         "when building squads, suggesting transfers, or evaluating decisions.\n\n"
@@ -265,6 +284,17 @@ deep_agent = create_deep_agent(
         "Use its filters (position, tier, min_price/max_price, min_minutes) rather than hand-filtering. "
         "When answering recommendation questions, cite the tier and 1-2 dominant factors driving the score, "
         "and call out set-piece duties (especially primary penalty takers) since they materially raise ceiling.\n"
+        "6a) For news-shaped questions — injuries, suspensions, press conference quotes, "
+        "predicted lineups, rotation rumours, price-change alerts, manager statements, or "
+        "anything the FPL API / static data cannot cover — call search_web. Prefer FPL-specific "
+        "tools first; escalate to search_web only when the question is explicitly news/rumour-shaped "
+        "or prior tool calls returned insufficient data. RECENCY: use the CURRENT DATE noted above "
+        "(never assume an older year). For 'this week' / 'latest' / 'right now' queries, include "
+        "the current year (and month if helpful) in the query string and pass time_range='d' or 'w'. "
+        "For general news use time_range='m'. If the first call returns stale or empty results, retry "
+        "with a tighter time_range and/or an explicit date in the query. ALWAYS cite the source URLs "
+        "inline (e.g. `(source: <url>)`). Do not call search_web redundantly after get_fpl_player or "
+        "get_fpl_scored_rankings for the same player unless the user explicitly asked about news.\n"
         "7) For full-squad-build requests ('build me a 15-man squad', 'pick my team'), "
         "first call get_fpl_upcoming_gameweek so the build is anchored to the next GW "
         "(quote the GW id and deadline in the answer). Then call get_fpl_scored_rankings "

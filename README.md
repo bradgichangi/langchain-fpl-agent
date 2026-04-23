@@ -9,6 +9,7 @@ It can answer manager-specific questions, rank players with a composite scoring 
 
 ## Features
 
+- Web search (DuckDuckGo) for injuries, pressers, predicted lineups, and news (cites source URLs)
 - Manager analysis (team, picks, bank, value, free transfers)
 - Upcoming gameweek awareness (fixtures, deadline, blanking players)
 - Composite player ranking engine (`modules/scoring_module.py`) with:
@@ -97,6 +98,7 @@ You should see your agent address in stdout.
 - `get_fpl_top_players(metric, limit, position=None)`
 - `get_fpl_scored_rankings(...)`
 - `get_fpl_chip_opportunities(manager_id, gameweek=None, horizon_gws=6)`
+- `search_web(query, max_results=5, news_only=False)` — DuckDuckGo web search for injuries, pressers, predicted lineups, rumours, and price-change news; returns structured results with source URLs for inline citation
 
 ## Session Manager ID Memory
 

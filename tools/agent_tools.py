@@ -6,6 +6,11 @@ from urllib.request import urlopen
 
 from langchain_core.tools import tool
 
+try:
+    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+except ImportError:  # Optional dep: web search tool disabled if not installed.
+    DuckDuckGoSearchAPIWrapper = None  # type: ignore[assignment]
+
 from modules.chip_opportunity_module import ChipTimingEngine, serialize_chip_scores
 from tools.fixtures import get_fixtures_by_gameweek
 from tools.fpl_static import load_bootstrap, load_player_rankings
@@ -981,3 +986,103 @@ def get_fpl_chip_opportunities(
     )
     return dumps(payload, indent=2)
 
+
+_ALLOWED_TIME_RANGES = {"d", "w", "m", "y"}
+
+
+@lru_cache(maxsize=8)
+def _ddg_wrapper(time_range: str) -> "DuckDuckGoSearchAPIWrapper":
+    if DuckDuckGoSearchAPIWrapper is None:
+        raise RuntimeError(
+            "DuckDuckGo search is unavailable. Install langchain-community and "
+            "ddgs (see requirements.txt)."
+        )
+    return DuckDuckGoSearchAPIWrapper(time=time_range)
+
+
+@tool
+def search_web(
+    query: str,
+    max_results: int = 5,
+    news_only: bool = False,
+    time_range: str = "m",
+) -> str:
+    """Search the web via DuckDuckGo for real-time info not covered by FPL tools.
+
+    Use for injuries, suspensions, press conference quotes, predicted lineups,
+    rotation rumours, price-change alerts, manager statements, or any question
+    where the FPL API / static data would be stale. Prefer dedicated FPL tools
+    first; only escalate here when the question is news/rumour-shaped or other
+    tools returned insufficient data. Always cite the returned source URLs.
+
+    IMPORTANT - recency: the current date is injected into the agent's system
+    prompt. When composing queries about "this week" / "latest" / "now", include
+    the current year explicitly in the query string AND pick a tight time_range
+    ("d" for today, "w" for this week) so stale articles from earlier seasons
+    are filtered out.
+
+    Args:
+        query: free-form search query. Include the current year for recency-
+            sensitive questions (e.g. "Saka injury update April 2026").
+        max_results: number of results to return (1-10, default 5).
+        news_only: restrict to DuckDuckGo news results when True (default False).
+        time_range: recency filter. One of "d" (past day), "w" (past week),
+            "m" (past month, default), "y" (past year). Use "d" or "w" for
+            "this week" / "latest" questions; "m" for general news; "y" for
+            background/context.
+    """
+    logger.info(
+        "Tool call start | search_web | query=%s | max_results=%s | news_only=%s | time_range=%s",
+        query,
+        max_results,
+        news_only,
+        time_range,
+    )
+    q = (query or "").strip()
+    if not q:
+        return dumps({"error": "query is required."})
+    try:
+        limit = max(1, min(int(max_results), 10))
+    except (TypeError, ValueError):
+        limit = 5
+
+    tr = (time_range or "m").strip().lower()
+    if tr not in _ALLOWED_TIME_RANGES:
+        tr = "m"
+
+    try:
+        wrapper = _ddg_wrapper(tr)
+    except RuntimeError as exc:
+        logger.warning("search_web unavailable | err=%s", exc)
+        return dumps({"error": str(exc)})
+
+    source = "news" if news_only else "text"
+    try:
+        raw = wrapper.results(q, max_results=limit, source=source)
+    except Exception as exc:  # Network / upstream failures shouldn't crash the agent.
+        logger.exception("search_web failure | query=%s", q)
+        return dumps({"error": f"Web search failed: {exc}"})
+
+    results = []
+    for item in raw or []:
+        results.append(
+            {
+                "title": item.get("title"),
+                "url": item.get("link"),
+                "snippet": item.get("snippet"),
+                "published": item.get("date"),
+                "source": item.get("source"),
+            }
+        )
+
+    logger.info("Tool call done | search_web | results=%s", len(results))
+    return dumps(
+        {
+            "query": q,
+            "source": source,
+            "time_range": tr,
+            "result_count": len(results),
+            "results": results,
+        },
+        indent=2,
+    )
