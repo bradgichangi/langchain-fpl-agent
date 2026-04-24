@@ -54,6 +54,19 @@ _CLEAR_ID_RE = re.compile(
     r"\b(forget|clear|remove|reset)\b.{0,24}\b(manager\s*id|my\s*id|id)\b",
     flags=re.IGNORECASE,
 )
+_CLEAR_HISTORY_RE = re.compile(
+    r"\b(forget|clear|reset|wipe)\b.{0,24}"
+    r"\b(history|chat|messages?|conversation|context|memory)\b",
+    flags=re.IGNORECASE,
+)
+
+# Session chat history (in-memory only; cleared on process restart).
+# `_MAX_HISTORY_TURNS` counts user/assistant pairs (16 messages total at cap).
+_MAX_HISTORY_TURNS = 8
+_MAX_HISTORY_CHARS = 8000
+# Char budget for the compact history snippet that feeds the reasoning pass.
+_REASONING_HISTORY_CHARS = 2000
+CHAT_HISTORY_BY_SENDER: dict[str, list[dict[str, str]]] = {}
 
 
 def _send_text_reply(sender: str, text: str) -> ChatMessage:
@@ -158,6 +171,56 @@ def _handle_session_manager_id(sender: str, user_text: str) -> tuple[str | None,
 
     return None, _inject_manager_context(user_text, sender)
 
+
+def _append_history(sender: str, role: str, content: str) -> None:
+    """Append one message and enforce per-sender size/char caps."""
+    if not content:
+        return
+    history = CHAT_HISTORY_BY_SENDER.setdefault(sender, [])
+    history.append({"role": role, "content": content})
+    max_messages = _MAX_HISTORY_TURNS * 2
+    if len(history) > max_messages:
+        del history[: len(history) - max_messages]
+    total = sum(len(m["content"]) for m in history)
+    while total > _MAX_HISTORY_CHARS and len(history) > 1:
+        dropped = history.pop(0)
+        total -= len(dropped["content"])
+
+
+def _clear_chat_history(sender: str) -> bool:
+    """Remove all stored messages for a sender; True if anything was dropped."""
+    return CHAT_HISTORY_BY_SENDER.pop(sender, None) is not None
+
+
+def _wants_to_clear_chat_history(text: str) -> bool:
+    return bool(_CLEAR_HISTORY_RE.search(text))
+
+
+def _prior_messages(sender: str) -> list[dict[str, str]]:
+    """Return a shallow copy of the sender's history for deep-agent replay."""
+    return list(CHAT_HISTORY_BY_SENDER.get(sender) or [])
+
+
+def _conversation_context(sender: str) -> str:
+    """Recent history formatted as a prose block for the reasoning pass.
+
+    Oldest messages are dropped first if the full history exceeds
+    `_REASONING_HISTORY_CHARS`.
+    """
+    history = CHAT_HISTORY_BY_SENDER.get(sender) or []
+    if not history:
+        return "(none)"
+    rendered = "\n".join(
+        f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+        for msg in history
+    )
+    if len(rendered) <= _REASONING_HISTORY_CHARS:
+        return rendered
+    # Head-truncate so the most recent turns stay in frame.
+    excess = len(rendered) - _REASONING_HISTORY_CHARS
+    return "…(older history truncated)…\n" + rendered[excess:]
+
+
 agent = Agent(
     name="FPL Bot",
     port=8000,
@@ -190,11 +253,15 @@ reasoning_prompt = ChatPromptTemplate.from_messages(
             "Do NOT say you lack access to data, cannot verify, or cannot access tools. "
             "If evidence is missing a requested field, state that specific limitation. "
             "If tool evidence contains web search results with URLs, preserve those URLs "
-            "as inline citations (e.g. `(source: <url>)`) in the final answer.",
+            "as inline citations (e.g. `(source: <url>)`) in the final answer. "
+            "If conversation context is provided below, use it to resolve follow-up "
+            "references (pronouns, 'my team', 'that player', 'the same GW') — do NOT "
+            "ask the user to repeat info they already shared earlier in the session.",
         ),
         (
             "human",
-            "User request:\n{user_text}\n\n"
+            "Conversation so far (oldest → newest):\n{conversation_context}\n\n"
+            "Current user request:\n{user_text}\n\n"
             "Tool evidence (already available):\n{tool_evidence}\n\n"
             "Draft answer:\n{draft_answer}\n\n"
             "Return only the final improved answer.",
@@ -310,10 +377,22 @@ deep_agent = create_deep_agent(
 )
 
 
-def run_deep_agent(user_text: str, thread_id: str) -> str:
-    logger.info("Deep agent invoke start | thread_id=%s", thread_id)
+def run_deep_agent(
+    user_text: str,
+    thread_id: str,
+    prior_messages: list[dict[str, str]] | None = None,
+    conversation_context: str = "(none)",
+) -> str:
+    history_turns = len(prior_messages or [])
+    logger.info(
+        "Deep agent invoke start | thread_id=%s | history_turns=%s",
+        thread_id,
+        history_turns,
+    )
+    deep_messages: list[dict[str, str]] = list(prior_messages or [])
+    deep_messages.append({"role": "user", "content": user_text})
     result = deep_agent.invoke(
-        {"messages": [{"role": "user", "content": user_text}]},
+        {"messages": deep_messages},
         config={"configurable": {"thread_id": thread_id}},
     )
     draft_answer = "No response generated."
@@ -340,6 +419,7 @@ def run_deep_agent(user_text: str, thread_id: str) -> str:
             "user_text": user_text,
             "draft_answer": draft_answer,
             "tool_evidence": tool_evidence,
+            "conversation_context": conversation_context,
         }
     )
     logger.info("Reasoning pass done | thread_id=%s", thread_id)
@@ -367,22 +447,46 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             "I can help with FPL manager, fixtures, and player questions. "
             "Send a request and include manager ID for team-specific analysis."
         )
+    elif _wants_to_clear_chat_history(user_text):
+        cleared = _clear_chat_history(sender)
+        reply = (
+            "Chat history cleared for this session."
+            if cleared
+            else "No chat history to clear for this session."
+        )
     else:
         immediate_reply, augmented_user_text = _handle_session_manager_id(sender, user_text)
         if immediate_reply is not None:
             reply = immediate_reply
         else:
+            prior = _prior_messages(sender)
+            context = _conversation_context(sender)
             try:
-                reply = run_deep_agent(augmented_user_text, thread_id=sender)
+                reply = run_deep_agent(
+                    augmented_user_text,
+                    thread_id=sender,
+                    prior_messages=prior,
+                    conversation_context=context,
+                )
             except URLError as exc:
                 logger.exception("FPL API network error | sender=%s", sender)
                 reply = f"Could not reach FPL endpoint: {exc}"
             except Exception as exc:
                 logger.exception("Unhandled agent error | sender=%s", sender)
                 reply = f"LLM error: {exc}"
+            else:
+                # Only persist the turn when the deep agent produced a reply.
+                # Store the raw user text (not the manager-id-augmented form).
+                _append_history(sender, "user", user_text)
+                _append_history(sender, "assistant", reply)
 
     await ctx.send(sender, _send_text_reply(sender, reply))
-    logger.info("Reply sent | sender=%s | reply_chars=%s", sender, len(reply))
+    logger.info(
+        "Reply sent | sender=%s | reply_chars=%s | history_msgs=%s",
+        sender,
+        len(reply),
+        len(CHAT_HISTORY_BY_SENDER.get(sender) or []),
+    )
 
 
 @chat_protocol.on_message(model=ChatAcknowledgement)
