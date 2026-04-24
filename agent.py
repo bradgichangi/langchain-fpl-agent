@@ -22,6 +22,7 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from tools.agent_tools import (
+    build_fpl_squad,
     get_fpl_chip_opportunities,
     get_fpl_fixtures,
     get_fpl_manager_current_team,
@@ -32,6 +33,7 @@ from tools.agent_tools import (
     get_fpl_upcoming_gameweek,
     search_fpl_players,
     search_web,
+    validate_fpl_squad,
 )
 
 load_dotenv(".env.local")
@@ -286,6 +288,8 @@ deep_agent = create_deep_agent(
         get_fpl_player,
         get_fpl_top_players,
         get_fpl_scored_rankings,
+        build_fpl_squad,
+        validate_fpl_squad,
         search_fpl_players,
         search_web,
     ],
@@ -364,11 +368,13 @@ deep_agent = create_deep_agent(
         "get_fpl_scored_rankings for the same player unless the user explicitly asked about news.\n"
         "7) For full-squad-build requests ('build me a 15-man squad', 'pick my team'), "
         "first call get_fpl_upcoming_gameweek so the build is anchored to the next GW "
-        "(quote the GW id and deadline in the answer). Then call get_fpl_scored_rankings "
-        "once per position with the appropriate price ceilings (keep must_play_upcoming=True so "
-        "no blanking players are picked), and assemble exactly 2 GK / 5 DEF / 5 MID / 3 FWD "
-        "that fits within the user's budget (default £100.0m if unknown), respects the "
-        "max-3-per-club rule, and where possible leaves a usable bank. Always show the squad "
+        "(quote the GW id and deadline in the answer). Then call build_fpl_squad with "
+        "budget_m (default £100.0m if unknown) to construct a deterministic 15-man team "
+        "under constraints (2/5/5/3, max 3 per club, budget). BEFORE finalizing the "
+        "answer, you MUST call validate_fpl_squad on those player ids as an assertion. "
+        "If validator says `is_valid` false, call build_fpl_squad again with adjusted "
+        "inputs once, then re-validate. If `is_valid` true, use validator `total_cost_m` "
+        "and `bank_m` verbatim. Always show the squad "
         "split by position with prices and a sum, verify the sum is within budget, "
         "confirm no club has more than 3 selections, and confirm every selected player has "
         "a fixture in the upcoming GW.\n\n"

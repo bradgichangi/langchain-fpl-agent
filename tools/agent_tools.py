@@ -689,6 +689,12 @@ _POSITION_ALIASES = {
     "MID": "MIDFIELDER", "MIDFIELDER": "MIDFIELDER",
     "FWD": "FORWARD", "FORWARD": "FORWARD",
 }
+_POSITION_SHORT = {
+    "GOALKEEPER": "GK",
+    "DEFENDER": "DEF",
+    "MIDFIELDER": "MID",
+    "FORWARD": "FWD",
+}
 
 
 @tool
@@ -825,6 +831,365 @@ def get_fpl_scored_rankings(
         },
         indent=2,
     )
+
+
+@tool
+def build_fpl_squad(
+    budget_m: float = 100.0,
+    must_play_upcoming: bool = True,
+) -> str:
+    """Build a full 15-man FPL squad deterministically.
+
+    This is a constraint solver for full-squad requests. It constructs exactly:
+    2 GK, 5 DEF, 5 MID, 3 FWD, max 3 per club, total cost <= budget_m.
+    """
+    logger.info(
+        "Tool call start | build_fpl_squad | budget_m=%s | must_play_upcoming=%s",
+        budget_m,
+        must_play_upcoming,
+    )
+    try:
+        rankings = load_player_rankings().get("players") or []
+    except FileNotFoundError as exc:
+        return dumps({"error": str(exc)})
+
+    try:
+        budget_val = float(budget_m)
+    except (TypeError, ValueError):
+        budget_val = 100.0
+    budget_val = round(budget_val, 1)
+
+    _, upcoming_by_team = get_upcoming_fixture_map()
+    required = {"GOALKEEPER": 2, "DEFENDER": 5, "MIDFIELDER": 5, "FORWARD": 3}
+
+    # Candidate pools by position, pre-sorted by score desc then cheaper price.
+    pools: dict[str, list[dict]] = {k: [] for k in required}
+    for p in rankings:
+        pos = p.get("position")
+        if pos not in pools:
+            continue
+        price = p.get("price")
+        if price is None:
+            continue
+        upcoming = _summarize_upcoming(p.get("team_id"), upcoming_by_team)
+        if must_play_upcoming and not upcoming["plays_upcoming"]:
+            continue
+        pools[pos].append(
+            {
+                "id": p.get("id"),
+                "name": p.get("web_name"),
+                "team": p.get("team"),
+                "team_id": p.get("team_id"),
+                "position": pos,
+                "price_m": float(price),
+                "score": float(p.get("score") or 0.0),
+                "tier": p.get("tier"),
+                "upcoming_opponents": upcoming["opponents"],
+            }
+        )
+    for pos in pools:
+        pools[pos].sort(key=lambda x: (-x["score"], x["price_m"]))
+
+    chosen: list[dict] = []
+    chosen_ids: set[int] = set()
+    club_counts: dict[str, int] = {}
+
+    # First pass: best-score greedy under club cap.
+    for pos, need in required.items():
+        for cand in pools[pos]:
+            pid = cand["id"]
+            team = cand["team"] or "?"
+            if not isinstance(pid, int) or pid in chosen_ids:
+                continue
+            if club_counts.get(team, 0) >= 3:
+                continue
+            chosen.append(cand)
+            chosen_ids.add(pid)
+            club_counts[team] = club_counts.get(team, 0) + 1
+            if sum(1 for c in chosen if c["position"] == pos) >= need:
+                break
+
+    # Ensure required counts filled.
+    for pos, need in required.items():
+        have = sum(1 for c in chosen if c["position"] == pos)
+        if have < need:
+            return dumps(
+                {
+                    "error": f"Could not fill required position count for {pos}.",
+                    "required": required,
+                    "filled": {
+                        k: sum(1 for c in chosen if c["position"] == k)
+                        for k in required
+                    },
+                },
+                indent=2,
+            )
+
+    def _total_cost(rows: list[dict]) -> float:
+        return round(sum(r["price_m"] for r in rows), 1)
+
+    # Budget repair pass: swap expensive picks for cheaper same-position options.
+    max_repairs = 120
+    repairs = 0
+    while _total_cost(chosen) > budget_val and repairs < max_repairs:
+        repairs += 1
+        over_by = round(_total_cost(chosen) - budget_val, 1)
+        best_swap: tuple[float, float, int, dict] | None = None
+        # (score_loss_per_million_saved, score_loss, chosen_index, replacement)
+        for idx, cur in enumerate(chosen):
+            pos = cur["position"]
+            cur_team = cur["team"] or "?"
+            for rep in pools[pos]:
+                rep_id = rep["id"]
+                rep_team = rep["team"] or "?"
+                if rep_id in chosen_ids or rep["price_m"] >= cur["price_m"]:
+                    continue
+                # Club cap after swap:
+                next_cur_team_count = club_counts.get(cur_team, 0) - 1
+                next_rep_team_count = club_counts.get(rep_team, 0) + (0 if rep_team == cur_team else 1)
+                if rep_team != cur_team and next_rep_team_count > 3:
+                    continue
+                savings = round(cur["price_m"] - rep["price_m"], 1)
+                if savings <= 0:
+                    continue
+                score_loss = round(cur["score"] - rep["score"], 4)
+                loss_per_m = score_loss / savings
+                candidate = (loss_per_m, score_loss, idx, rep)
+                # Prefer minimal score loss per saved million; if tie, bigger savings.
+                if best_swap is None or candidate[:2] < best_swap[:2]:
+                    best_swap = candidate
+                if savings >= over_by and score_loss <= 0.08:
+                    best_swap = candidate
+                    break
+            if best_swap is not None and (cur["price_m"] - best_swap[3]["price_m"]) >= over_by:
+                break
+
+        if best_swap is None:
+            break
+
+        _, _, idx, rep = best_swap
+        cur = chosen[idx]
+        cur_team = cur["team"] or "?"
+        rep_team = rep["team"] or "?"
+        chosen_ids.remove(cur["id"])
+        chosen_ids.add(rep["id"])
+        chosen[idx] = rep
+        club_counts[cur_team] = club_counts.get(cur_team, 0) - 1
+        if club_counts[cur_team] <= 0:
+            club_counts.pop(cur_team, None)
+        club_counts[rep_team] = club_counts.get(rep_team, 0) + 1
+
+    total_cost_m = _total_cost(chosen)
+    bank_m = round(budget_val - total_cost_m, 1)
+    pos_counts = {
+        k: sum(1 for c in chosen if c["position"] == k)
+        for k in required
+    }
+    is_valid = (
+        len(chosen) == 15
+        and all(pos_counts[k] == required[k] for k in required)
+        and max(club_counts.values(), default=0) <= 3
+        and bank_m >= 0
+    )
+
+    payload = {
+        "is_valid": is_valid,
+        "budget_m": budget_val,
+        "total_cost_m": total_cost_m,
+        "bank_m": bank_m,
+        "position_counts": {(_POSITION_SHORT[k]): v for k, v in pos_counts.items()},
+        "club_counts": club_counts,
+        "repairs_used": repairs,
+        "players": sorted(
+            chosen,
+            key=lambda c: (
+                {"GOALKEEPER": 1, "DEFENDER": 2, "MIDFIELDER": 3, "FORWARD": 4}[c["position"]],
+                -c["score"],
+            ),
+        ),
+    }
+    if not is_valid:
+        payload["warnings"] = [
+            "Deterministic builder could not fully satisfy all constraints.",
+            "Try a higher budget or relax must_play_upcoming.",
+        ]
+    logger.info(
+        "Tool call done | build_fpl_squad | valid=%s | total_cost_m=%s | bank_m=%s | repairs=%s",
+        is_valid,
+        total_cost_m,
+        bank_m,
+        repairs,
+    )
+    return dumps(payload, indent=2)
+
+
+@tool
+def validate_fpl_squad(player_ids: list[int], budget_m: float = 100.0) -> str:
+    """Validate a proposed FPL squad with deterministic rule checks.
+
+    Checks:
+    - exactly 15 unique players
+    - position split exactly 2 GK / 5 DEF / 5 MID / 3 FWD
+    - max 3 players per club
+    - total cost <= budget
+    """
+    logger.info(
+        "Tool call start | validate_fpl_squad | players=%s | budget_m=%s",
+        len(player_ids) if isinstance(player_ids, list) else 0,
+        budget_m,
+    )
+    if not isinstance(player_ids, list) or not player_ids:
+        return dumps({"error": "player_ids must be a non-empty list of integers."})
+
+    bootstrap = fetch_fpl_bootstrap_live()
+    elements = bootstrap.get("elements") or []
+    teams = bootstrap.get("teams") or []
+    by_id = {p.get("id"): p for p in elements if p.get("id") is not None}
+    team_by_id = {t.get("id"): t for t in teams if t.get("id") is not None}
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    required_pos = {"GK": 2, "DEF": 5, "MID": 5, "FWD": 3}
+
+    requested_count = len(player_ids)
+    unique_ids: list[int] = []
+    duplicates: list[int] = []
+    seen: set[int] = set()
+    for raw_pid in player_ids:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid in seen:
+            duplicates.append(pid)
+            continue
+        seen.add(pid)
+        unique_ids.append(pid)
+
+    resolved: list[dict] = []
+    missing: list[int] = []
+    pos_counts = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
+    club_counts: dict[str, int] = {}
+    total_tenths = 0
+
+    for pid in unique_ids:
+        player = by_id.get(pid)
+        if not player:
+            missing.append(pid)
+            continue
+        cost_tenths = int(player.get("now_cost") or 0)
+        total_tenths += cost_tenths
+        team = team_by_id.get(player.get("team"), {})
+        team_name = team.get("short_name") or team.get("name") or "?"
+        pos = pos_map.get(player.get("element_type")) or "?"
+        if pos in pos_counts:
+            pos_counts[pos] += 1
+        club_counts[team_name] = club_counts.get(team_name, 0) + 1
+        resolved.append(
+            {
+                "id": pid,
+                "name": player.get("web_name"),
+                "team": team_name,
+                "position": pos,
+                "price_m": round(cost_tenths / 10, 1),
+            }
+        )
+
+    total_cost_m = round(total_tenths / 10, 1)
+    try:
+        budget_val = float(budget_m)
+    except (TypeError, ValueError):
+        budget_val = 100.0
+    budget_val = round(budget_val, 1)
+    bank_m = round(budget_val - total_cost_m, 1)
+
+    size_ok = len(resolved) == 15 and requested_count == 15 and not missing and not duplicates
+    positions_ok = all(pos_counts[k] == v for k, v in required_pos.items())
+    club_ok = max(club_counts.values(), default=0) <= 3
+    budget_ok = bank_m >= 0
+
+    violations: list[str] = []
+    if requested_count != 15:
+        violations.append(f"Input contained {requested_count} ids (expected 15).")
+    if duplicates:
+        violations.append(f"Duplicate player ids: {duplicates}")
+    if missing:
+        violations.append(f"Unknown/missing player ids: {missing}")
+    if not positions_ok:
+        violations.append(
+            f"Invalid position split: got {pos_counts}, expected {required_pos}."
+        )
+    offenders = {team: n for team, n in club_counts.items() if n > 3}
+    if offenders:
+        violations.append(f"Club limit exceeded (>3): {offenders}")
+    if not budget_ok:
+        violations.append(f"Over budget by £{abs(bank_m):.1f}m.")
+
+    # Structured logging for observability during squad validation.
+    by_position: dict[str, list[str]] = {"GK": [], "DEF": [], "MID": [], "FWD": [], "?": []}
+    for p in resolved:
+        pos_key = p.get("position") if p.get("position") in by_position else "?"
+        by_position[pos_key].append(
+            f"{p.get('name')}[{p.get('id')}] {p.get('team')} £{p.get('price_m')}m"
+        )
+    logger.info(
+        "validate_fpl_squad squad | ids=%s | budget_m=%.1f",
+        unique_ids,
+        budget_val,
+    )
+    logger.info(
+        "validate_fpl_squad composition | GK=%s | DEF=%s | MID=%s | FWD=%s | unknown=%s",
+        by_position["GK"],
+        by_position["DEF"],
+        by_position["MID"],
+        by_position["FWD"],
+        by_position["?"],
+    )
+    logger.info(
+        "validate_fpl_squad counts | requested=%s | resolved=%s | duplicates=%s | missing=%s",
+        requested_count,
+        len(resolved),
+        duplicates,
+        missing,
+    )
+    logger.info(
+        "validate_fpl_squad totals | total_cost_m=%.1f | budget_m=%.1f | bank_m=%.1f | "
+        "size_ok=%s | positions_ok=%s | club_ok=%s | budget_ok=%s",
+        total_cost_m,
+        budget_val,
+        bank_m,
+        size_ok,
+        positions_ok,
+        club_ok,
+        budget_ok,
+    )
+    if violations:
+        logger.warning("validate_fpl_squad violations | %s", " | ".join(violations))
+
+    payload = {
+        "is_valid": size_ok and positions_ok and club_ok and budget_ok,
+        "budget_m": budget_val,
+        "total_cost_m": total_cost_m,
+        "bank_m": bank_m,
+        "checks": {
+            "size_ok": size_ok,
+            "positions_ok": positions_ok,
+            "max_three_per_club_ok": club_ok,
+            "budget_ok": budget_ok,
+        },
+        "position_counts": pos_counts,
+        "club_counts": club_counts,
+        "duplicates": duplicates,
+        "missing_player_ids": missing,
+        "violations": violations,
+        "players": resolved,
+    }
+
+    logger.info(
+        "Tool call done | validate_fpl_squad | valid=%s | total_cost_m=%s | bank_m=%s",
+        payload["is_valid"],
+        total_cost_m,
+        bank_m,
+    )
+    return dumps(payload, indent=2)
 
 
 @tool
